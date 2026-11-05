@@ -1,0 +1,27 @@
+[project]
+name = "payback-agent"
+version = "0.1.0"
+description = "Tool-calling agent over the payback-mcp read-only MCP server (four-level A-share review chain)"
+readme = "README.md"
+authors = [
+    { name = "yingxuan.zhang", email = "yingxuan.zhang@transsion.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "mcp",
+    "httpx",
+    "starlette>=1.8.0",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+payback-agent = "payback_agent.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.12,<0.11.0"]
+build-backend = "uv_build"
