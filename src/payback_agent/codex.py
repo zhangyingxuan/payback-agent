@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+from collections.abc import AsyncIterator
 
 import anyio
 
@@ -43,7 +45,7 @@ def _codex_command() -> list[str]:
 
 
 class CodexClient:
-    async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> ChatResult:
+    async def chat_stream(self, messages: list[dict], tools: list[dict] | None = None) -> AsyncIterator[tuple[str, Any]]:
         # 工具仅由现有循环执行，避免 CLI 直接访问数据库或执行用户要求的命令。
         prompt = ("遵循 messages 中的 system 指令，根据已有消息回答。需要查询时只返回 "
                   "tool_calls，name 必须来自 tools，arguments 必须是 JSON 对象字符串。"
@@ -67,29 +69,55 @@ class CodexClient:
             data = json.dumps({"instruction": prompt, "messages": messages, "tools": tools or []},
                               ensure_ascii=False).encode("utf-8")
             with anyio.fail_after(180):
-                result = await anyio.run_process(command, input=data, check=False)
+                async with await anyio.open_process(command, stderr=subprocess.DEVNULL) as process:
+                    assert process.stdin is not None and process.stdout is not None
+                    await process.stdin.send(data)
+                    await process.stdin.aclose()
+                    buffer = b""
+                    final_text = None
+                    async for chunk in process.stdout:
+                        buffer += chunk
+                        lines = buffer.split(b"\n")
+                        buffer = lines.pop()
+                        for line in lines:
+                            if not line.strip():
+                                continue
+                            event = json.loads(line)
+                            item = event.get("item") or {}
+                            if event.get("type") == "item.completed" and item.get("type") == "reasoning":
+                                if item.get("text"):
+                                    yield ("reasoning_delta", item["text"] + "\n\n")
+                            elif event.get("type") == "item.completed" and item.get("type") == "agent_message":
+                                final_text = item.get("text")
+                    returncode = await process.wait()
+                    if returncode:
+                        raise LlmError(f"Codex CLI 执行失败（退出码 {returncode}），请检查登录及模型配置")
+                    if not final_text:
+                        raise LlmError("Codex CLI 返回了无法解析的结果")
+                    response = json.loads(final_text)
+                    calls = []
+                    for index, call in enumerate(response["tool_calls"]):
+                        arguments = call["arguments"]
+                        if not isinstance(arguments, str):
+                            arguments = json.dumps(arguments, ensure_ascii=False)
+                        calls.append({"id": f"codex_{index}", "type": "function",
+                                      "function": {"name": call["name"], "arguments": arguments}})
+                    message: dict[str, Any] = {"role": "assistant", "content": response["content"] or ""}
+                    if calls:
+                        message["tool_calls"] = calls
+                    if message["content"]:
+                        yield ("delta", message["content"])
+                    yield ("result", ChatResult(message=message,
+                           finish_reason="tool_calls" if calls else "stop"))
         except (OSError, TimeoutError) as exc:
             raise LlmError(f"Codex CLI 启动失败或超时：{type(exc).__name__}") from exc
+        except (ValueError, KeyError, TypeError, UnicodeError) as exc:
+            raise LlmError("Codex CLI 返回了无法解析的结果") from exc
         finally:
             os.unlink(schema_path)
-        if result.returncode:
-            raise LlmError(f"Codex CLI 执行失败（退出码 {result.returncode}），请检查登录及模型配置")
-        try:
-            events = [json.loads(line) for line in result.stdout.decode("utf-8").splitlines()]
-            text = next(event["item"]["text"] for event in reversed(events)
-                        if event.get("type") == "item.completed"
-                        and event.get("item", {}).get("type") == "agent_message")
-            response = json.loads(text)
-            calls = []
-            for index, call in enumerate(response["tool_calls"]):
-                arguments = call["arguments"]
-                if not isinstance(arguments, str):
-                    arguments = json.dumps(arguments, ensure_ascii=False)
-                calls.append({"id": f"codex_{index}", "type": "function",
-                              "function": {"name": call["name"], "arguments": arguments}})
-            message: dict[str, Any] = {"role": "assistant", "content": response["content"] or ""}
-            if calls:
-                message["tool_calls"] = calls
-            return ChatResult(message=message, finish_reason="tool_calls" if calls else "stop")
-        except (ValueError, KeyError, TypeError, StopIteration, UnicodeError) as exc:
-            raise LlmError("Codex CLI 返回了无法解析的结果") from exc
+
+    async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> ChatResult:
+        async for kind, payload in self.chat_stream(messages, tools):
+            if kind == "result":
+                return payload
+        raise LlmError("Codex CLI 返回了无法解析的结果")

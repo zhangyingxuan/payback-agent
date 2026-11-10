@@ -9,6 +9,45 @@ from payback_agent.codex import CodexClient
 from payback_agent.llm import LlmError
 
 
+
+def _mock_process(monkeypatch, run):
+    # 复用现有请求断言，同时模拟逐行读取子进程输出。
+    class Process:
+        def __init__(self, command):
+            self.command = command
+            self.stdin = self
+            self.stdout = self
+            self.data = b""
+            self.result = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def send(self, data):
+            self.data = data
+
+        async def aclose(self):
+            pass
+
+        def __aiter__(self):
+            return self.read()
+
+        async def read(self):
+            self.result = await run(self.command, input=self.data, check=False)
+            if self.result.stdout:
+                yield self.result.stdout + bytes([10])
+
+        async def wait(self):
+            return self.result.returncode
+
+    async def open_process(command, **kwargs):
+        return Process(command)
+
+    monkeypatch.setattr(anyio, 'open_process', open_process)
+
 def test_windows_npm_codex_uses_node_entrypoint(monkeypatch, tmp_path):
     from payback_agent import codex
 
@@ -29,7 +68,7 @@ def test_windows_npm_codex_uses_node_entrypoint(monkeypatch, tmp_path):
                  'text': json.dumps({'content': 'ok', 'tool_calls': []})}}
         return SimpleNamespace(returncode=0, stdout=json.dumps(event).encode(), stderr=b'')
 
-    monkeypatch.setattr(anyio, 'run_process', run)
+    _mock_process(monkeypatch, run)
     assert anyio.run(CodexClient().chat, []).message['content'] == 'ok'
 
 
@@ -41,7 +80,7 @@ def test_codex_response_can_request_a_database_tool(monkeypatch):
         message = {'content': None, 'tool_calls': [{'name': 'get_limit_up_structure', 'arguments': {'date': 'yesterday'}}]}
         event = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(message)}}
         return SimpleNamespace(returncode=0, stdout=(json.dumps(event) + '\n').encode(), stderr=b'')
-    monkeypatch.setattr(anyio, 'run_process', run)
+    _mock_process(monkeypatch, run)
     result = anyio.run(CodexClient().chat, [{'role': 'user', 'content': '昨天涨停多少'}], [{'function': {'name': 'get_limit_up_structure'}}])
     assert result.message['tool_calls'][0]['function'] == {'name': 'get_limit_up_structure', 'arguments': '{"date": "yesterday"}'}
 
@@ -49,7 +88,7 @@ def test_codex_response_can_request_a_database_tool(monkeypatch):
 def test_codex_failure_is_reported_without_exposing_stderr(monkeypatch):
     async def run(command, **kwargs):
         return SimpleNamespace(returncode=1, stdout=b'', stderr=b'secret')
-    monkeypatch.setattr(anyio, 'run_process', run)
+    _mock_process(monkeypatch, run)
     with pytest.raises(LlmError, match='Codex') as error:
         anyio.run(CodexClient().chat, [])
     assert 'secret' not in str(error.value)
@@ -63,10 +102,52 @@ def test_codex_backend_does_not_require_gateway_credentials(monkeypatch):
     assert isinstance(config.create_llm_client(), CodexClient)
 
 
+def test_codex_stream_forwards_reasoning_and_final_answer(monkeypatch):
+    async def run(command, **kwargs):
+        events = [
+            {'type': 'item.completed', 'item': {'type': 'reasoning', 'text': '先核对数据'}},
+            {'type': 'item.completed', 'item': {'type': 'agent_message',
+             'text': json.dumps({'content': '## 结论', 'tool_calls': []})}},
+        ]
+        return SimpleNamespace(returncode=0, stdout='\n'.join(map(json.dumps, events)).encode())
+
+    _mock_process(monkeypatch, run)
+
+    async def collect():
+        return [event async for event in CodexClient().chat_stream([])]
+
+    events = anyio.run(collect)
+    assert events[0] == ('reasoning_delta', '先核对数据\n\n')
+    assert events[1] == ('delta', '## 结论')
+    assert events[-1][1].message['content'] == '## 结论'
+
+
+def test_codex_stream_reads_real_subprocess_output(monkeypatch, tmp_path):
+    from payback_agent import codex
+
+    script = tmp_path / 'fake_codex.py'
+    script.write_text(
+        'import json, sys\n'
+        'sys.stdin.buffer.read()\n'
+        'print(json.dumps({"type":"item.completed","item":{"type":"reasoning","text":"分析"}}), flush=True)\n'
+        'print(json.dumps({"type":"item.completed","item":{"type":"agent_message",'
+        '"text":json.dumps({"content":"结论","tool_calls":[]})}}), flush=True)\n',
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(codex, '_codex_command', lambda: [sys.executable, str(script)])
+
+    async def collect():
+        return [event async for event in CodexClient().chat_stream([])]
+
+    events = anyio.run(collect)
+    assert events[0] == ('reasoning_delta', '分析\n\n')
+    assert events[-1][1].message['content'] == '结论'
+
+
 def test_codex_output_must_be_valid_json(monkeypatch):
     async def run(command, **kwargs):
         return SimpleNamespace(returncode=0, stdout=b'{"type":"item.completed","item":{"type":"agent_message","text":"bad"}}\n', stderr=b'')
-    monkeypatch.setattr(anyio, 'run_process', run)
+    _mock_process(monkeypatch, run)
     with pytest.raises(LlmError, match='无法解析'):
         anyio.run(CodexClient().chat, [])
 
@@ -85,12 +166,12 @@ def test_web_chat_uses_codex_tool_results(monkeypatch):
         event = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(response)}}
         return SimpleNamespace(returncode=0, stdout=(json.dumps(event) + '\n').encode(), stderr=b'')
 
-    monkeypatch.setattr(anyio, 'run_process', run)
-    service = AgentService()
+    _mock_process(monkeypatch, run)
+    from sqlite_memory import MemoryStore as TestMemoryStore
+    service = AgentService(memory=TestMemoryStore(":memory:"))
     service._client = CodexClient()
-    service._source = FakeSource({'get_market_overview': '{"limit_up_qty": 42}'})
-    service._system_prompt = '使用工具数据回答'
+    service._source = FakeSource({'get_market_overview': '{"data_as_of":"2026-10-13","limit_up_qty":42}'})
     with TestClient(create_app(agent=service)) as client:
         events = _events(client.post('/chat', json={'message': '昨天涨停几家'}))
     assert [event['type'] for event in events] == ['session', 'tool_call', 'tool_result', 'delta', 'done']
-    assert events[-1]['content'] == '涨停 42 家'
+    assert events[-1]['content'].startswith('涨停 42 家')

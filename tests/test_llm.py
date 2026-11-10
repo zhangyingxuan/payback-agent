@@ -171,6 +171,26 @@ def test_stream_yields_deltas_then_one_assembled_result():
     assert result.finish_reason == "stop" and result.usage["total_tokens"] == 21
 
 
+def test_stream_preserves_reasoning_separately_from_answer():
+    client = _client(lambda request: _sse(
+        {"choices": [{"delta": {"reasoning_content": "先分析"}}]},
+        {"choices": [{"delta": {"reasoning_content": "数据"}}]},
+        _delta("结论")))
+    events = _stream(client)
+    assert events[:3] == [("reasoning_delta", "先分析"),
+                          ("reasoning_delta", "数据"), ("delta", "结论")]
+    assert events[-1][1].message["reasoning_content"] == "先分析数据"
+    assert events[-1][1].message["content"] == "结论"
+
+
+def test_json_fallback_emits_reasoning():
+    client = _client(lambda request: httpx.Response(
+        200, json={"choices": [{"message": {"role": "assistant", "content": "结论",
+                                               "reasoning_content": "分析"}}]}))
+    events = _stream(client)
+    assert events[0] == ("reasoning_delta", "分析")
+
+
 def test_stream_request_asks_for_streaming_and_usage():
     seen = {}
 

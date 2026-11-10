@@ -42,3 +42,10 @@ def test_the_shipped_prompt_locks_the_four_levels_and_the_disclaimer():
 
 def test_the_prompt_file_is_found_from_the_repo_root():
     assert prompt.SYSTEM_PROMPT_PATH.is_file()
+
+
+def test_review_output_guides_summary_evidence_and_compact_markdown():
+    text = prompt.load_system_prompt(today=date(2026, 10, 15))
+    for item in ('复盘摘要', '市场全景', '短线生态', '位置与收益', '相似日与观察条件',
+                 '简短问题', '不要编造', '不超过 4 列'):
+        assert item in text

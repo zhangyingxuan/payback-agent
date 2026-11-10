@@ -35,6 +35,7 @@ def _payload(text: str) -> Any:
 async def collect_evidence(source: Any, date: str = "yesterday",
                            *, levels: list[int] | None = None) -> dict:
     """Call every shipped tool once for ``date`` and return their payloads."""
+    # 按分析链依次采集，单个工具失败不阻止检查其他工具。
     sections: dict[str, Any] = {}
     for name, extra in STEPS:
         args = {"date": date, **extra}

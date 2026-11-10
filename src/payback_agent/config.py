@@ -9,7 +9,7 @@ bug factory.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -105,3 +105,29 @@ def create_llm_client():
         from .llm import ChatClient
         return ChatClient(get_llm_config())
     raise ConfigError("AGENT_LLM_BACKEND 必须是 gateway 或 codex")
+
+
+@dataclass(frozen=True)
+class MemoryMysqlConfig:
+    host: str
+    port: int
+    user: str
+    password: str = field(repr=False)
+    database: str = ''
+
+
+def get_memory_mysql_config() -> MemoryMysqlConfig:
+    # 独立账号避免误用行情 MCP 的只读凭据或扩大其权限。
+    prefix = 'AGENT_MEMORY_MYSQL_'
+    names = ('HOST', 'PORT', 'USER', 'PASSWORD', 'NAME')
+    missing = [prefix + key for key in names if not os.environ.get(prefix + key)]
+    if missing:
+        raise ConfigError('missing environment variables: ' + ', '.join(missing))
+    try:
+        port = int(os.environ[prefix + 'PORT'])
+        if not 1 <= port <= 65535:
+            raise ValueError
+    except ValueError:
+        raise ConfigError(prefix + 'PORT must be between 1 and 65535') from None
+    return MemoryMysqlConfig(os.environ[prefix + 'HOST'], port, os.environ[prefix + 'USER'],
+                             os.environ[prefix + 'PASSWORD'], os.environ[prefix + 'NAME'])

@@ -122,6 +122,7 @@ class ChatClient:
         one corrupt chunk must not kill an otherwise healthy answer.
         """
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_calls: dict[int, dict] = {}
         finish_reason: str | None = None
         usage: dict = {}
@@ -138,7 +139,11 @@ class ChatClient:
                         data = json.loads(body)
                     except ValueError as exc:
                         raise LlmError(f"gateway returned non-JSON: {body[:200]}") from exc
-                    yield ("result", _result_from_data(data))
+                    result = _result_from_data(data)
+                    reasoning = result.message.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        yield ("reasoning_delta", reasoning)
+                    yield ("result", result)
                     return
                 async for line in response.aiter_lines():
                     line = line.strip()
@@ -160,6 +165,10 @@ class ChatClient:
                     delta = choice.get("delta") or {}
                     if delta.get("role"):
                         role = delta["role"]
+                    reasoning = delta.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        reasoning_parts.append(reasoning)
+                        yield ("reasoning_delta", reasoning)
                     text = delta.get("content")
                     if text:
                         content_parts.append(text)
@@ -182,6 +191,8 @@ class ChatClient:
             raise LlmError(f"gateway unreachable: {type(exc).__name__}: {exc}") from exc
 
         message: dict = {"role": role, "content": "".join(content_parts)}
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
         if tool_calls:
             message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
         yield ("result", ChatResult(message=message, finish_reason=finish_reason, usage=usage))

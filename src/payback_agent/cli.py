@@ -103,13 +103,12 @@ async def _ask_one(client: ChatClient, source: Any, question: str, system_prompt
 
 
 async def _run(args: argparse.Namespace, argv: list[str]) -> int:
-    system_prompt = load_system_prompt()
     client = config.create_llm_client()
     try:
         async with open_stdio_source(argv) as source, open_trace(args.trace) as trace:
             if args.question:
                 answer = await _ask_one(client, source, " ".join(args.question),
-                                        system_prompt, args, trace)
+                                        load_system_prompt(), args, trace)
                 _emit(answer, args)
                 return 0
             print(f"payback-agent REPL：回车提问，exit 退出"
@@ -123,7 +122,7 @@ async def _run(args: argparse.Namespace, argv: list[str]) -> int:
                 if not line:
                     continue
                 try:
-                    answer = await _ask_one(client, source, line, system_prompt, args,
+                    answer = await _ask_one(client, source, line, load_system_prompt(), args,
                                             trace, history)
                 except LlmError as exc:
                     # One bad turn must not end the session: print, keep going.

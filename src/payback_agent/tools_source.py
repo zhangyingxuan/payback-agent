@@ -44,6 +44,7 @@ class McpStdioSource:
         # (bad server path, server crashes on boot) the subprocess still has to be
         # torn down, and the only reliable way to say that is to nest the two
         # context managers and let the unwinding do it.
+        # 统一管理子进程和会话，初始化失败时也能按相反顺序释放资源。
         stack = AsyncExitStack()
         try:
             read, write = await stack.enter_async_context(stdio_client(self._params))

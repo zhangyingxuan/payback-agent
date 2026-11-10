@@ -8,7 +8,9 @@ arguments, unknown tools, iteration cap) is unit-testable with two fakes.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Protocol
 
 from .bridge import openai_tools
@@ -100,8 +102,12 @@ def _echo_assistant(message: dict, ids: list[str], iteration: int) -> dict:
              "function": {"name": function.get("name") or "",
                           "arguments": function.get("arguments") or "{}"}}
         )
-    return {"role": "assistant", "content": message.get("content") or "",
-            "tool_calls": echoed_calls}
+    echoed = {"role": "assistant", "content": message.get("content") or "",
+              "tool_calls": echoed_calls}
+    # 部分推理模型要求工具调用后回传原始推理字段。
+    if message.get("reasoning_content"):
+        echoed["reasoning_content"] = message["reasoning_content"]
+    return echoed
 
 
 async def ask_events(
@@ -138,6 +144,7 @@ async def ask_events(
     but a user/assistant text turn is a caller bug and raises before the request
     goes out -- a silently mangled stack is worse than a loud one.
     """
+    # 只接收用户可见的历史文本，避免旧工具结果混入新一轮证据。
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
     for turn in history or []:
         if turn.get("role") not in ("user", "assistant") or not isinstance(
@@ -152,8 +159,11 @@ async def ask_events(
 
     usage: dict = {}
     content = ""
+    evidence: dict[str, dict] = {}
+    failed: dict[str, str] = {}
     stream = getattr(llm, "chat_stream", None)
 
+    # 模型可以多轮请求工具；设置上限防止反复调用导致请求无法结束。
     for iteration in range(1, max_turns + 1):
         if trace is not None:
             await trace.write({"type": "llm_request", "iteration": iteration,
@@ -161,15 +171,15 @@ async def ask_events(
         if stream is not None:
             result = None
             async for kind, payload in stream(messages, tools):
-                if kind == "delta":
-                    yield {"type": "delta", "iteration": iteration, "text": payload}
-                else:  # ("result", ChatResult) -- exactly one, terminal
+                if kind == "reasoning_delta":
+                    yield {"type": kind, "iteration": iteration, "text": payload}
+                elif kind == "result":
                     result = payload
         else:
             result = await llm.chat(messages, tools)
-            text = result.message.get("content") or ""
-            if text:
-                yield {"type": "delta", "iteration": iteration, "text": text}
+            if result.message.get("reasoning_content"):
+                yield {"type": "reasoning_delta", "iteration": iteration,
+                       "text": result.message["reasoning_content"]}
         message = result.message
         if (message.get("content") or "").strip():
             content = message["content"]
@@ -183,10 +193,43 @@ async def ask_events(
 
         calls = message.get("tool_calls") or []
         if not calls:
+            # 先核对证据再展示正文，避免未经核验的数字在流式输出中短暂出现。
+            requested_code = re.search(r'(?<!\d)\d{6}(?!\d)', question)
+            # 涉及具体个股的次日操作或走势必须有同一标的证据，不能仅凭模型记忆作答。
+            stock_plan = bool(re.search(r'支撑|压力|个股.*预案|\d{6}.*预案', question)) or bool(
+                (requested_code or re.search(r'个股|股票', question))
+                and re.search(r'明天|明日|次日|下一交易日|操作|策略|预案|走势|分析|怎么看', question)
+            )
+            stock_evidence = evidence.get("get_stock_review", {})
+            stock_code = str(stock_evidence.get("stock", {}).get("thscode", ""))
+            stock_missing = stock_plan and (not stock_evidence or (requested_code and not stock_code.startswith(requested_code.group())))
+            if stock_missing or ((not evidence or failed) and (re.search(r'\d', content) or re.search(r'行情|复盘|涨停|跌停|出手|市场', question))):
+                content = "证据不足：本轮数据缺失或查询失败，无法判断。"
+            notes = []
+            if failed:
+                notes.append("部分数据查询失败或缺失：" + "、".join(failed))
+            dates = {str(value.get("data_as_of")) for value in evidence.values() if value.get("data_as_of")}
+            if dates:
+                label = "数据日期不一致" if len(dates) > 1 else "实际数据日期"
+                notes.append(label + "：" + "、".join(f"{name}={value.get('data_as_of')}" for name, value in evidence.items() if value.get("data_as_of")))
+            today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
+            future_plan = bool(stock_evidence and re.search(r'明日|明天|次日|下一交易日', question))
+            if today in dates:
+                if not future_plan and re.search(r'今天|今日|现在|当前|盘中|出手', question):
+                    content = "证据不足：当日数据的完成状态未知，无法判断当前盘面。"
+                notes.append("当日数据的收盘完成状态和原始数据更新时间未知，不可据此认定为实时或完整收盘数据。")
+            elif dates and not future_plan and re.search(r'今天|今日|现在|当前|盘中|出手', question):
+                content = "证据不足：历史数据不能用于判断当前盘面。"
+                notes.append("所用数据并非今日数据，无法据此判断当前盘面；原始数据更新时间未知。")
+            if notes:
+                content = content.strip() + "\n\n数据提示：" + "；".join(notes)
+            if content.strip():
+                yield {"type": "delta", "iteration": iteration, "text": content.strip()}
             yield {"type": "done", "content": content.strip(), "iterations": iteration,
                    "truncated": False, "usage": usage, "messages": messages}
             return
 
+        # 先回放模型的工具请求，再用相同 ID 回填结果，满足对话协议。
         ids = [""] * len(calls)
         messages.append(_echo_assistant(message, ids, iteration))
 
@@ -213,6 +256,21 @@ async def ask_events(
                 except Exception as exc:  # unknown tool, transport hiccup, server crash
                     error = f"tool call failed: {exc}"
                     outcome = _error_payload(f"tool {name!r} failed: {exc}")
+            # 只有可解析且未报错的数据才作为回答依据，失败信息单独保留。
+            if error is None:
+                try:
+                    payload = json.loads(outcome)
+                except (ValueError, TypeError):
+                    payload = None
+                if isinstance(payload, dict):
+                    if payload.get("error") or payload.get("found") is False:
+                        error = str(payload.get("error") or payload.get("hint") or "数据缺失")
+                    elif payload.get("data_as_of") or (name == "get_global_quote" and payload.get("price") is not None):
+                        evidence[name] = payload
+            if error:
+                failed[name] = error
+            else:
+                failed.pop(name, None)
             if trace is not None:
                 await trace.write({"type": "tool_call", "iteration": iteration,
                                    "tool_call_id": ids[index], "name": name,
@@ -225,7 +283,8 @@ async def ask_events(
 
     # Iteration cap: hand back whatever the model last said, flagged. Silence here
     # would read as "the agent finished thinking", which is the opposite of true.
-    yield {"type": "done", "content": content.strip(), "iterations": max_turns,
+    # 迭代上限时模型尚未基于最后一次工具结果回答，中间文本不能当作结论。
+    yield {"type": "done", "content": "证据处理未完成，无法判断。", "iterations": max_turns,
            "truncated": True, "usage": usage, "messages": messages}
 
 

@@ -17,7 +17,7 @@
 | ④ | `get_similar_days`（把 ①②③ 合成"像今天这样的盘面，历史上次日发生了什么"）+ `get_even_board_ladder` |
 
 设计文档：`payback/docs/superpowers/specs/2026-10-15-payback-agent-design.md`。
-本仓库不含 SQL、不含数据库凭据：数字只能来自工具。
+行情数字只能来自工具；Agent 使用独立 MySQL 账号存储会话与用户偏好。
 
 ## 前置条件
 
@@ -48,6 +48,8 @@ AGENT_LLM_MODEL=deepseek-chat
 
 ## 用法
 
+配置 `payback-mcp/.env` 中的 `FUYAO_API_KEY` 后，可询问“000001 明日盘中预案及短中长线支撑压力”。助手依据同花顺前复权日线给出量能与历史高低点观察条件；行情完成状态、停牌及除权需另行核实，盘中实时触发尚未接入。
+
 ```bash
 # 1) 不要网关也能跑：把四级证据取全，验证数据链路
 uv run payback-agent --dry-run --for-date yesterday
@@ -76,16 +78,26 @@ uv run payback-agent --serve
 ```
 
 stdout 只有答案（或 `--json` 的结果），工具调用清单、警告、REPL 提示全部走 stderr。
+正文在证据检查后一次性发送；工具调用进度仍实时发送。行情问题缺少有效工具结果或工具失败时返回证据不足，并标注实际数据日期和日期不一致。时效无法确认时不将历史数据作为当前盘面判断。
 
 ## serve 模式（网页对接）
 
-三个端点，无鉴权，默认只听 127.0.0.1：
+“每日 AI 全景复盘”使用 `get_daily_panorama` 读取同一交易日的市场、板块、梯队和跌停名单，并在生成时读取腾讯外围行情；外围是生成时最新报价，可能延迟或属于其他交易日。Agent 服务在工作日 16:10 后每 15 分钟检查一次，当日数据完整且未归档时生成复盘；市场和短线记录的时间必须为当日 15:00 或之后，非交易日、午盘数据或数据缺失不会被当作收盘数据。服务需持续运行，生成失败会在当日下次检查时重试；生成结果保存在 `data/daily_reports/`。若记录时间未随更新而刷新，或历史补录时间不是交易当日，需先核实数据，不能自动生成。
+
+`GET /daily-reports/latest` 读取最新报告，`GET /daily-reports/YYYY-MM-DD` 读取指定日期，`POST /daily-reports/YYYY-MM-DD` 手动重新生成。报告包含市场快照、生成时外围报价及 AI 文本；历史日期的外围报价不是历史行情。与现有 `/chat` 相同，这些端点无鉴权，仅应在可信本机或受保护的反向代理后使用。
+
+会话读取接口为 GET /sessions；长期偏好可通过 /memories 的 GET、POST、PUT、DELETE 管理。
+
+以下端点无鉴权，默认只听 127.0.0.1：
 
 | 端点 | 行为 |
 |---|---|
 | `GET /healthz` | `{"status":"ok","sessions":N}` |
 | `POST /chat` `{message, session_id?}` | SSE 流；不带 `session_id` 则新建并在首个事件里返回 |
 | `DELETE /sessions/{id}` | 丢弃一个会话的服务端历史 |
+| `GET /daily-reports/latest` | 读取最新一份每日复盘 |
+| `GET /daily-reports/{date}` | 读取指定交易日的复盘 |
+| `POST /daily-reports/{date}` | 生成或重新生成指定交易日的复盘 |
 
 SSE 事件就是 `ask_events` 的事件流，外加两个服务级事件：
 
@@ -104,7 +116,11 @@ error        {"message"}                       本轮失败（会话历史保持
 实现要点（细节在 `serve.py` 模块 docstring）：单个 worker 任务独占 MCP 会话与网关
 client，请求只通过 memory channel 投递作业——anyio cancel scope 绝不跨 `yield`，
 客户端断连在 worker 的下一次事件发送处自然传播，丢弃本轮、会话不受污染。
-会话为内存 LRU（64 个），服务重启即清空，客户端把可见消息存在自己的 localStorage。
+服务端将完成的问答和用户显式保存的长期偏好存入 MySQL。按 .env.example 配置专用的 AGENT_MEMORY_MYSQL_* 账号；账号需要目标数据库的 CREATE 权限，以及三张 agent_* 记忆表的 SELECT、INSERT、UPDATE、DELETE 权限。服务首次访问时创建表，行情 MCP 的只读账号和权限不受影响。上下文仍只携带最近 8 轮，工具原文不进入历史；前端保留本机聊天记录并恢复服务端会话。
+
+升级时，如已有 SQLite 文件，应在新 MySQL 目标为空、启动 Agent 并写入新记录之前执行 uv run python -m payback_agent.migrate_memory [旧文件路径]。省略路径时优先读取旧 AGENT_MEMORY_PATH，否则使用 data/memory.sqlite3。迁移以事务写入且保留源文件，相同快照重复执行不会重复导入；目标已有数据时会拒绝导入，需先备份并人工处理。只有浏览器 localStorage 的旧记录不包含在此迁移中。
+
+长期记忆可在聊天页“管理长期记忆”中新增、编辑、删除，每条最多 500 字，最多 50 条。记忆仅作为用户偏好，不替代本轮行情工具；接口与 /chat 一样没有鉴权，只能在可信环境使用。
 
 ## 退出码
 
@@ -158,7 +174,7 @@ system [+ 最近 8 轮的问答] + user
 1. **工具结果原样透传**。payback-mcp 的三态契约（命中 / `found:false` / `error`）就是给
    模型看的第二层提示词，agent 不改写、不替它圆场。
 2. **agent 不做参数校验**。重复实现一遍校验只会和工具口径漂移；错了就回填错误，让模型改口。
-3. **降级不崩溃**。任何一次工具失败都变成一条 tool 消息，模型自己决定换路径；
+3. **降级不崩溃**。工具失败变成 tool 消息供模型重试；未恢复的失败会向用户显示并限制行情结论；
    只有配置和网关这种"外部前置条件不成立"才响着退出。
 4. **历史只带看得见的问答**。`append_turn` 只把"用户问的 + 模型最后说的"接进下一轮，
    上一轮的工具结果不进消息栈：一次四级取证就有约 2.9 万字符，重放它既撑爆上下文，
@@ -175,7 +191,7 @@ system [+ 最近 8 轮的问答] + user
 
 ## 安全边界
 
-- 只读：本仓库不装 pymysql、不读 `AGENT_MYSQL_*`，一切数据经 payback-mcp 的只读账号。
+- 行情数据只通过 payback-mcp 的只读账号访问；Agent 使用独立 MySQL 账号读写会话及偏好，不使用行情账号。
 - payback-mcp 子进程只走 stdio，不监听端口；`--serve` 默认只听 127.0.0.1，
   无鉴权，不要直接暴露公网（前面要有带认证的反代）。
 - trace 里没有凭据：只记录请求消息栈与工具结果，`Authorization` 头不进 trace；

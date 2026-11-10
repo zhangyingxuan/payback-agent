@@ -91,11 +91,34 @@ def test_plain_answer_never_touches_a_tool():
     llm = FakeLlm({"role": "assistant", "content": "涨停 42 家（2026-10-13）"})
     source = FakeSource()
     answer = _ask("昨天涨停几家", llm, source)
-    assert answer.content == "涨停 42 家（2026-10-13）"
+    assert "证据不足" in answer.content
     assert answer.iterations == 1 and answer.tool_calls == [] and not answer.truncated
     assert source.calls == []
     # system + user only; nothing invented was pushed onto the stack
     assert [m["role"] for m in answer.messages] == ["system", "user"]
+
+
+def test_reasoning_is_forwarded_and_preserved_for_tool_continuation():
+    llm = FakeLlm(
+        {"role": "assistant", "content": "", "reasoning_content": "先查数据",
+         "tool_calls": [_call("c1", "market")]},
+        {"role": "assistant", "content": "完成"},
+    )
+    events = _events("复盘", llm, FakeSource({"market": "ok"}))
+    assert any(e["type"] == "reasoning_delta" and e["text"] == "先查数据" for e in events)
+    assert llm.requests[1][0][2]["reasoning_content"] == "先查数据"
+
+
+def test_streaming_reasoning_is_forwarded():
+    class ReasoningLlm(FakeStreamLlm):
+        async def chat_stream(self, messages, tools=None):
+            yield ("reasoning_delta", "分析")
+            yield ("delta", "结论")
+            yield ("result", ChatResult(message={"role": "assistant", "content": "结论"}))
+
+    events = _events("问题", ReasoningLlm(), FakeSource())
+    assert [(e["type"], e.get("text")) for e in events] == [
+        ("reasoning_delta", "分析"), ("delta", "结论"), ("done", None)]
 
 
 def test_tool_result_is_backfilled_and_the_followup_answers():
@@ -106,7 +129,7 @@ def test_tool_result_is_backfilled_and_the_followup_answers():
     source = FakeSource({"get_market_overview": '{"data_as_of": "2026-10-13", "limit_up_qty": 42}'})
     answer = _ask("昨天涨停几家", llm, source)
 
-    assert answer.content == "42 家，数据日期 2026-10-13"
+    assert answer.content.startswith("42 家，数据日期 2026-10-13")
     assert answer.iterations == 2
     assert source.calls == [("get_market_overview", {"date": "yesterday"})]
     assert answer.tool_calls[0].error is None
@@ -134,7 +157,7 @@ def test_server_side_error_contract_reaches_the_model_unchanged():
     assert json.loads(sent["content"]) == {
         "requested": "today", "error": "window_days must be >= 1"
     }
-    assert answer.tool_calls[0].error is None  # the tool ran; the *data* errored
+    assert answer.tool_calls[0].error == "window_days must be >= 1"
 
 
 def test_parallel_calls_in_one_turn_are_all_run_and_paired():
@@ -186,7 +209,7 @@ def test_a_hallucinated_tool_becomes_a_tool_message_instead_of_crashing():
     )
     source = FakeSource({"get_market_overview": "{}"})
     answer = _ask("推荐一只票", llm, source)
-    assert answer.content == "这个工具不存在，我改用现有数据回答"
+    assert "数据查询失败" in answer.content
     payload = json.loads(llm.requests[1][0][3]["content"])
     assert "get_stock_tip" in payload["error"]
     assert answer.tool_calls[0].error.startswith("tool call failed")
@@ -292,10 +315,10 @@ def test_ask_events_streams_deltas_then_exactly_one_done():
     llm = FakeStreamLlm({"role": "assistant", "content": "42 家"})
     events = _events("昨天涨停几家", llm, FakeSource())
     kinds = [e["type"] for e in events]
-    assert kinds == ["delta"] * 4 + ["done"]
-    assert "".join(e["text"] for e in events if e["type"] == "delta") == "42 家"
+    assert kinds == ["delta", "done"]
+    assert "证据不足" in events[0]["text"]
     done = events[-1]
-    assert done["content"] == "42 家"
+    assert "证据不足" in done["content"]
     assert done["iterations"] == 1 and done["truncated"] is False
     assert done["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     assert [m["role"] for m in done["messages"]] == ["system", "user"]
@@ -307,26 +330,26 @@ def test_ask_events_announces_tool_calls_before_their_results():
          "tool_calls": [_call("c1", "get_market_overview", '{"date":"yesterday"}')]},
         {"role": "assistant", "content": "42 家"},
     )
-    source = FakeSource({"get_market_overview": '{"limit_up_qty": 42}'})
+    source = FakeSource({"get_market_overview": '{"data_as_of":"2026-10-13","limit_up_qty":42}'})
     events = _events("昨天涨停几家", llm, source)
     kinds = [e["type"] for e in events]
-    assert kinds == ["tool_call", "tool_result", "delta", "delta", "delta", "delta", "done"]
+    assert kinds == ["tool_call", "tool_result", "delta", "done"]
 
     announced = events[0]
     assert announced["iteration"] == 1 and announced["name"] == "get_market_overview"
     assert announced["arguments"] == '{"date":"yesterday"}'  # raw, pre-parse
     resolved = events[1]
     assert resolved["arguments"] == {"date": "yesterday"}  # parsed for the record
-    assert resolved["result"] == '{"limit_up_qty": 42}'
+    assert json.loads(resolved["result"])["limit_up_qty"] == 42
     assert resolved["error"] is None and resolved["tool_call_id"] == "c1"
-    assert events[-1]["content"] == "42 家" and events[-1]["iterations"] == 2
+    assert events[-1]["content"].startswith("42 家") and events[-1]["iterations"] == 2
 
 
 def test_ask_events_falls_back_to_chat_as_one_delta_per_iteration():
     llm = FakeLlm({"role": "assistant", "content": "42 家"})
     events = _events("昨天涨停几家", llm, FakeSource())
     assert [e["type"] for e in events] == ["delta", "done"]
-    assert events[0]["text"] == "42 家"
+    assert "证据不足" in events[0]["text"]
 
 
 def test_ask_events_delta_carries_the_iteration_and_done_keeps_the_last_nonempty_one():
@@ -335,11 +358,10 @@ def test_ask_events_delta_carries_the_iteration_and_done_keeps_the_last_nonempty
          "tool_calls": [_call("c1", "get_market_overview")]},
         {"role": "assistant", "content": "最终结论"},
     )
-    events = _events("复盘", llm, FakeSource({"get_market_overview": "{}"}))
+    events = _events("复盘", llm, FakeSource({"get_market_overview": '{"data_as_of":"2026-10-13"}'}))
     deltas = [e for e in events if e["type"] == "delta"]
-    assert {e["iteration"] for e in deltas if e["text"] in "先看整体"} == {1}
-    assert all(e["iteration"] == 2 for e in deltas[-4:])
-    assert events[-1]["content"] == "最终结论"
+    assert len(deltas) == 1 and deltas[0]["iteration"] == 2
+    assert events[-1]["content"].startswith("最终结论")
 
 
 def test_ask_events_reports_bad_arguments_in_the_tool_result_event():

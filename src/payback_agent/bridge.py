@@ -19,6 +19,7 @@ def openai_tools(tools: list[Any]) -> list[dict]:
     A tool with no description/schema gets the empty-but-valid shape rather than
     ``None``, because the gateway rejects a null ``parameters``.
     """
+    # 直接复用服务端的参数结构，避免模型看到的约束与工具实际校验不一致。
     out = []
     for tool in tools:
         schema = getattr(tool, "input_schema", None)
@@ -45,6 +46,7 @@ def tool_message_content(result: Any) -> str:
     model exactly as the server wrote it -- the agent layer must not smooth it
     over, that contract is half of the model's instructions.
     """
+    # 优先保留工具原始文本；没有文本时再尝试结构化结果。
     parts = []
     for item in getattr(result, "content", None) or []:
         text = getattr(item, "text", None)
