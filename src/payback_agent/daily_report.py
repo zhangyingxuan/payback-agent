@@ -45,8 +45,9 @@ async def build_report(source, llm, trade_date: str) -> dict:
             recorded = value if isinstance(value, str) and len(value) <= 40 else '未知'
             raise ValueError(f'{label}收盘数据未就绪（记录时间：{recorded}）；请先更新该交易日的大盘和短线数据，再生成复盘') from None
     # 外围行情逐个降级：单个指数不可用时仍保留其他证据和错误提示。
-    quotes = []
-    for symbol in _SYMBOLS:
+    quotes = panorama.get('global_quotes')
+    quotes = quotes if isinstance(quotes, list) else []
+    for symbol in (() if quotes else _SYMBOLS):
         try:
             quote = json.loads(await source.call_tool('get_global_quote', {'symbol': symbol}))
             if not isinstance(quote, dict):

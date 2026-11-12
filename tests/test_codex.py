@@ -104,6 +104,8 @@ def test_codex_backend_does_not_require_gateway_credentials(monkeypatch):
 
 def test_codex_stream_forwards_reasoning_and_final_answer(monkeypatch):
     async def run(command, **kwargs):
+        # 默认模型可能关闭摘要，必须在独立 CLI 调用中显式请求。
+        assert 'model_reasoning_summary="detailed"' in command
         events = [
             {'type': 'item.completed', 'item': {'type': 'reasoning', 'text': '先核对数据'}},
             {'type': 'item.completed', 'item': {'type': 'agent_message',

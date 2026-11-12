@@ -5,6 +5,9 @@ the error path are all exercised as production would."""
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+import anyio
 from types import SimpleNamespace
 
 from starlette.testclient import TestClient
@@ -70,11 +73,66 @@ def _answer(text):
     return {"role": "assistant", "content": text}
 
 
+def test_chat_selects_backend_per_request_and_rejects_unknown(monkeypatch):
+    from payback_agent import config
+    app, default, _ = _app(_answer('默认'), _answer('恢复默认'))
+    alternate = FakeLlm(_answer('切换成功'))
+    monkeypatch.setattr(config, 'create_llm_client', lambda backend=None: alternate)
+    with TestClient(app) as client:
+        assert client.post('/chat', json={'message': '你好', 'model': 'unknown'}).status_code == 400
+        assert _events(client.post('/chat', json={'message': '你好'}))[-1]['content'] == '默认'
+        assert _events(client.post('/chat', json={'message': '你好', 'model': 'codex'}))[-1]['content'] == '切换成功'
+        assert _events(client.post('/chat', json={'message': '你好'}))[-1]['content'] == '恢复默认'
+
+
 def test_healthz_reports_ok():
     app, _, _ = _app()
     with TestClient(app) as client:
         body = client.get("/healthz").json()
     assert body["status"] == "ok" and body["sessions"] == 0
+
+
+def test_slow_storage_does_not_block_health_check(monkeypatch):
+    app, _, service = _app()
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_sessions():
+        entered.set()
+        release.wait(timeout=3)
+        return []
+
+    monkeypatch.setattr(service.memory, 'sessions', slow_sessions)
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=2) as pool:
+        slow = pool.submit(client.get, '/sessions')
+        try:
+            assert entered.wait(timeout=2)
+            health = pool.submit(client.get, '/healthz')
+            try:
+                response = health.result(timeout=0.5)
+            except FutureTimeout:
+                raise AssertionError('存储查询阻塞了健康检查') from None
+            assert response.status_code == 200
+        finally:
+            release.set()
+            slow.result(timeout=3)
+
+
+def test_disconnected_queued_request_does_not_start_agent(monkeypatch):
+    _, _, service = _app()
+    started = []
+
+    async def ensure_ready():
+        started.append(True)
+
+    monkeypatch.setattr(service, '_ensure_ready', ensure_ready)
+
+    async def run():
+        send, receive = anyio.create_memory_object_stream(1)
+        await receive.aclose()
+        await service._run_job(('你好', 'session', send))
+
+    anyio.run(run)
+    assert started == []
 
 
 def test_chat_streams_session_then_the_loop_events():
@@ -123,6 +181,7 @@ def test_a_bad_body_is_a_400_before_any_stream_starts():
     app, _, _ = _app()
     with TestClient(app) as client:
         assert client.post("/chat", json={}).status_code == 400
+        assert client.post("/chat", json=["你好"]).status_code == 400
         assert client.post("/chat", json={"message": "  "}).status_code == 400
         bad_session = client.post("/chat", json={"message": "x", "session_id": 3})
         assert bad_session.status_code == 400
@@ -148,6 +207,30 @@ def test_sessions_can_be_deleted():
         session_id = events[0]["session_id"]
         assert client.delete(f"/sessions/{session_id}").json()["deleted"] is True
         assert client.delete(f"/sessions/{session_id}").json()["deleted"] is False
+
+
+def test_deleting_session_during_answer_does_not_restore_it():
+    app, llm, _ = _app(_answer('旧回答'))
+    entered, release = threading.Event(), threading.Event()
+    original_chat = llm.chat
+
+    async def slow_chat(messages, tools=None):
+        entered.set()
+        await anyio.to_thread.run_sync(release.wait, 3)
+        return await original_chat(messages, tools)
+
+    llm.chat = slow_chat
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(client.post, '/chat', json={'message': '你好', 'session_id': 's1'})
+        try:
+            assert entered.wait(timeout=2)
+            assert client.delete('/sessions/s1').json()['deleted'] is True
+        finally:
+            release.set()
+        events = _events(pending.result(timeout=3))
+        assert events[-1]['type'] == 'error'
+        assert not any(event['type'] == 'done' for event in events)
+        assert client.get('/sessions').json() == []
 
 
 def test_the_session_store_is_lru_capped():

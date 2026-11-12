@@ -125,9 +125,7 @@ async def _run(args: argparse.Namespace, argv: list[str]) -> int:
                     answer = await _ask_one(client, source, line, load_system_prompt(), args,
                                             trace, history)
                 except LlmError as exc:
-                    # One bad turn must not end the session: print, keep going.
-                    # The question is dropped too -- an unanswered turn would
-                    # otherwise haunt every later request as a dangling user row.
+                    # 单轮失败不应终止会话；同时丢弃未回答的问题，避免影响后续请求。
                     print(f"[网关失败] {exc}", file=sys.stderr)
                     continue
                 _emit(answer, args)
@@ -172,9 +170,7 @@ def _launch_failure_reason(exc: BaseException) -> str:
 
 
 def _serve(args: argparse.Namespace) -> int:
-    # Imported here, not at module top: the REPL and one-shot paths must keep
-    # working without uvicorn installed being load-bearing, and a --serve typo
-    # should not slow every CLI start.
+    # 仅在服务模式下导入，避免普通命令依赖 uvicorn 或增加启动开销。
     import uvicorn
 
     from .serve import create_app

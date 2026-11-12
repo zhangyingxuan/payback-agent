@@ -30,6 +30,18 @@ def test_daily_report_collects_snapshot_and_stores_it(tmp_path):
     assert read_report(tmp_path, '2026-10-13') == report
 
 
+def test_report_reuses_global_quotes_from_panorama():
+    """同一份快照不重复请求外围，避免图表和文字引用不同时间的报价。"""
+    class SnapshotSource(Source):
+        async def call_tool(self, name, arguments):
+            assert name == 'get_daily_panorama'
+            snapshot = json.loads(await super().call_tool(name, arguments))
+            snapshot['global_quotes'] = [{'symbol': 'HSI', 'price': '42'}]
+            return json.dumps(snapshot)
+    report = anyio.run(build_report, SnapshotSource(), Llm(), '2026-10-13')
+    assert report['global_quotes'] == report['panorama']['global_quotes']
+
+
 def test_report_rejects_missing_or_wrong_date(tmp_path):
     class BadSource(Source):
         async def call_tool(self, name, arguments):

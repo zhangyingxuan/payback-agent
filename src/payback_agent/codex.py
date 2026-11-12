@@ -56,6 +56,8 @@ class CodexClient:
             schema_path = schema.name
         command = _codex_command() + ["exec", "--json",
                    "--ephemeral", "--ignore-user-config", "--skip-git-repo-check",
+                   # 独立进程不读取用户配置，显式请求摘要以免沿用模型的关闭默认值。
+                   "-c", 'model_reasoning_summary="detailed"',
                    "--sandbox", "read-only", "--output-schema", schema_path]
         for feature in ("shell_tool", "unified_exec", "apps", "plugins", "browser_use",
                         "computer_use", "multi_agent", "hooks"):

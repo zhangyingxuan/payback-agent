@@ -18,8 +18,7 @@ from .config import LlmConfig
 CHAT_PATH = "/chat/completions"
 DEFAULT_TIMEOUT = 120.0
 
-# What ``chat_stream`` yields: ("delta", str) per content token as it arrives,
-# then exactly one ("result", ChatResult) with the fully assembled message.
+# chat_stream 逐次产生文本增量，最后产生一条包含完整消息的结果。
 StreamEvent = tuple[str, Any]
 
 
@@ -57,9 +56,7 @@ def _result_from_data(data: Any) -> ChatResult:
 class ChatClient:
     def __init__(self, config: LlmConfig, *, timeout: float = DEFAULT_TIMEOUT,
                  temperature: float = 0.2, transport: httpx.AsyncBaseTransport | None = None):
-        # The trailing slash is stripped where the join happens, not only in
-        # get_llm_config: base_url is handed to httpx as one opaque string, so a
-        # double slash survives into the request line and 404s on strict gateways.
+        # 拼接时去除末尾斜杠，避免双斜杠导致严格的网关返回 404。
         self._url = f"{config.base_url.rstrip('/')}{CHAT_PATH}"
         self._config = config
         self._temperature = temperature
@@ -82,8 +79,7 @@ class ChatClient:
             payload["tool_choice"] = "auto"
         if stream:
             payload["stream"] = True
-            # Without this the final usage chunk is omitted by most gateways,
-            # and a streamed answer would report no token counts at all.
+            # 要求网关返回最终用量，否则流式响应通常没有 token 计数。
             payload["stream_options"] = {"include_usage": True}
         return payload
 
@@ -94,9 +90,7 @@ class ChatClient:
         except httpx.HTTPError as exc:
             raise LlmError(f"gateway unreachable: {type(exc).__name__}: {exc}") from exc
         if response.status_code >= 400:
-            # Body first 500 chars: gateway reasons are usually in there, and the
-            # request id matters. The key is never echoed by the server, and we
-            # never print the request, so this stays safe to show a user.
+            # 响应前 500 字符通常包含错误原因和请求 ID；请求及密钥不会输出。
             raise LlmError(f"gateway HTTP {response.status_code}: {response.text[:500]}")
         try:
             data = response.json()

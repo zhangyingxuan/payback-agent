@@ -50,6 +50,32 @@ class MemoryStore:
             self.db.execute('INSERT INTO turns(session_id, question, answer) VALUES (?, ?, ?)',
                             (session_id, question, answer))
 
+    def session_page(self, limit: int, cursor: int | None, query: str) -> dict:
+        from payback_agent.memory import session_page_result
+        # 测试存储与 MySQL 使用同一聚合策略，搜索字符按字面匹配。
+        needle = query.lower()
+        rows = self.db.execute('''
+            SELECT s.session_id, substr(f.question, 1, 24), s.last_id,
+                   CASE WHEN ? = '' THEN '' ELSE substr(m.question || char(10) || m.answer,
+                       max(1, instr(lower(m.question || char(10) || m.answer), ?) - 40), 160) END
+            FROM (
+                SELECT session_id, min(id) first_id, max(id) last_id,
+                       min(CASE WHEN instr(lower(question || char(10) || answer), ?) > 0 THEN id END) match_id
+                FROM turns GROUP BY session_id
+                HAVING (? = '' OR match_id IS NOT NULL) AND (? IS NULL OR max(id) < ?)
+            ) s JOIN turns f ON f.id = s.first_id LEFT JOIN turns m ON m.id = s.match_id
+            ORDER BY s.last_id DESC LIMIT ?
+        ''', (needle, needle, needle, needle, cursor, cursor, limit + 1)).fetchall()
+        return session_page_result(rows, limit)
+
+    def session_detail(self, session_id: str) -> dict | None:
+        rows = self.db.execute('SELECT question, answer FROM turns WHERE session_id = ? ORDER BY id',
+                               (session_id,)).fetchall()
+        if not rows:
+            return None
+        return {'id': session_id, 'messages': [item for question, answer in rows for item in (
+            {'role': 'user', 'content': question}, {'role': 'assistant', 'content': answer})]}
+
     def delete_session(self, session_id: str) -> bool:
         with self.db:
             return self.db.execute('DELETE FROM turns WHERE session_id = ?', (session_id,)).rowcount > 0

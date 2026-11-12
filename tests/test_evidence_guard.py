@@ -86,3 +86,71 @@ def test_stock_strategy_rejects_evidence_for_different_stock():
     source = FakeSource({'get_stock_review': '{"data_as_of":"2026-10-13","stock":{"thscode":"600000.SH"}}'})
     events = _events('000001明天怎么操作', llm, source)
     assert '证据不足' in events[-1]['content']
+
+
+def test_named_stock_action_requires_stock_evidence():
+    llm = FakeLlm({'role': 'assistant', 'content': '明天开盘可以直接买入'})
+    events = _events('平安银行明天怎么操作', llm, FakeSource())
+    assert '证据不足' in events[-1]['content']
+    assert '买入' not in events[-1]['content']
+
+
+def test_stock_evidence_requires_a_resolved_stock_code():
+    llm = FakeLlm({'role': 'assistant', 'tool_calls': [_call('a', 'get_stock_review')]},
+                  {'role': 'assistant', 'content': '继续观察'})
+    source = FakeSource({'get_stock_review': '{"data_as_of":"2026-10-13"}'})
+    events = _events('这只股票明日操作策略', llm, source)
+    assert '证据不足' in events[-1]['content']
+
+
+def test_today_yesterday_comparison_fetches_and_keeps_both_snapshots():
+    from datetime import datetime, timedelta, timezone
+    today = datetime.now(timezone(timedelta(hours=8))).date()
+    yesterday = today - timedelta(days=1)
+
+    class DailySource(FakeSource):
+        async def call_tool(self, name, arguments):
+            self.calls.append((name, arguments))
+            day = today if arguments['date'] == 'today' else yesterday
+            return json.dumps({'data_as_of': day.isoformat(), 'requested': day.isoformat(),
+                               'limit_up_qty': 37 if day == today else 85,
+                               'create_time': day.isoformat() + 'T15:35:00'})
+
+    source = DailySource({'get_market_phase': '{}'})
+    llm = FakeLlm({'role': 'assistant', 'content': '今日涨停37家，昨日85家，短线活跃度下降。'})
+    events = _events('与昨日相比今日短线生态如何', llm, source)
+    assert {args['date'] for _, args in source.calls} == {'today', 'yesterday'}
+    answer = events[-1]['content']
+    assert '今日涨停37家' in answer
+    assert today.isoformat() in answer and yesterday.isoformat() in answer
+    assert '历史数据不能用于判断当前盘面' not in answer
+    assert '数据日期不一致' not in answer
+    assert '实时' in answer
+    # 同样的双日数据只能支持快照比较，不能绕过实时买卖判断的校验。
+    action = _events('与昨日相比今日短线生态如何，现在能出手吗',
+                     FakeLlm({'role': 'assistant', 'content': '现在可以买入'}), source)
+    assert '证据不足' in action[-1]['content']
+    assert '现在可以买入' not in action[-1]['content']
+
+
+def test_comparison_cannot_use_yesterday_as_todays_snapshot():
+    llm = FakeLlm({'role': 'assistant', 'content': '今日涨停37家'})
+    source = FakeSource({'get_market_phase': '{"data_as_of":"2020-01-01"}'})
+    events = _events('与昨日相比今日短线生态如何', llm, source)
+    assert '证据不足' in events[-1]['content']
+    assert '今日涨停37家' not in events[-1]['content']
+
+
+def test_same_tool_keeps_dates_for_each_successful_call():
+    class DailySource(FakeSource):
+        async def call_tool(self, name, arguments):
+            self.calls.append((name, arguments))
+            return json.dumps({'data_as_of': arguments['date']})
+
+    calls = [_call('a', 'get_market_phase', '{"date":"2026-11-12"}'),
+             _call('b', 'get_market_phase', '{"date":"2026-11-11"}')]
+    llm = FakeLlm({'role': 'assistant', 'tool_calls': calls},
+                  {'role': 'assistant', 'content': '两日对比'})
+    events = _events('复盘两日变化', llm, DailySource({'get_market_phase': '{}'}))
+    assert '2026-11-12' in events[-1]['content']
+    assert '2026-11-11' in events[-1]['content']

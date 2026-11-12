@@ -102,3 +102,16 @@ def test_mysql_replays_only_latest_eight_turns(mysql_config):
     assert len(history) == 16
     assert history[0]['content'] == 'question 2'
     assert history[-1]['content'] == 'answer 9'
+
+
+def test_mysql_summary_pagination_and_literal_search(mysql_config):
+    from payback_agent.memory import MemoryStore
+    store = MemoryStore(mysql_config)
+    store.save_turn('old', '标题', '正文 %_\\关键词')
+    store.save_turn('new', '新标题', '另一段正文')
+    page = store.session_page(1, None, '')
+    assert page['items'][0]['id'] == 'new'
+    assert store.session_page(1, int(page['nextCursor']), '')['items'][0]['id'] == 'old'
+    assert store.session_page(30, None, '%_\\')['items'][0]['id'] == 'old'
+    assert store.session_detail('old')['messages'][-1]['content'] == '正文 %_\\关键词'
+    assert store.session_detail('missing') is None

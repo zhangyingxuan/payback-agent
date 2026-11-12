@@ -64,6 +64,7 @@ uv run payback-agent
 # 4) 留证据：每一轮请求/响应/工具调用写 JSONL，可回放
 uv run payback-agent --trace traces/review.jsonl "现在打二板值不值得"
 uv run payback-agent --json --quiet "昨天涨停家数"     # 结构化输出，方便脚本消费
+uv run payback-agent "生成2026-11-09短线涨停梯队图片"  # 返回内嵌 SVG 的 Markdown
 
 # 5) serve 模式：HTTP+SSE 服务，给 payback 网页的 /chat 页面用
 uv run payback-agent --serve                 # 默认 127.0.0.1:8300
@@ -77,8 +78,12 @@ AGENT_LLM_MODEL=stub-model \
 uv run payback-agent --serve
 ```
 
+涨停梯队图顶部展示同一实际交易日的短线周期、晋级率、封板率、涨停数和跌停数；指标缺失或日期不一致时显示“未提供”。晋级率采用昨日涨停股今日晋级连板的比例，数据来自 `get_market_phase`，相邻采集日可能存在缺采。
+
 stdout 只有答案（或 `--json` 的结果），工具调用清单、警告、REPL 提示全部走 stderr。
 正文在证据检查后一次性发送；工具调用进度仍实时发送。行情问题缺少有效工具结果或工具失败时返回证据不足，并标注实际数据日期和日期不一致。时效无法确认时不将历史数据作为当前盘面判断。
+
+今日与昨日短线生态对比会预取两日 `get_market_phase`，同一工具的不同日期证据分别保留；两份数据均有效且包含今日时允许比较已采集快照，明确标注两日实际日期及可用的原始记录创建时间。创建时间不等于更新时间或收盘完成证明；实时操作问题仍受时效校验，今日数据缺失时不会用昨日数据替代。
 
 ## serve 模式（网页对接）
 
@@ -86,9 +91,13 @@ stdout 只有答案（或 `--json` 的结果），工具调用清单、警告、
 
 `GET /daily-reports/latest` 读取最新报告，`GET /daily-reports/YYYY-MM-DD` 读取指定日期，`POST /daily-reports/YYYY-MM-DD` 手动重新生成。报告包含市场快照、生成时外围报价及 AI 文本；历史日期的外围报价不是历史行情。与现有 `/chat` 相同，这些端点无鉴权，仅应在可信本机或受保护的反向代理后使用。
 
-会话读取接口为 GET /sessions；长期偏好可通过 /memories 的 GET、POST、PUT、DELETE 管理。
+会话列表使用 `GET /sessions?view=summary&limit=30`：返回 `{items, nextCursor}`，摘要仅含 `id/title/lastTurnId/snippet`。追加 `cursor=<nextCursor>` 获取更早会话，`q=<关键词>` 搜索完整历史的标题来源（首问）及问答正文，返回命中片段。搜索词最多 200 字符，limit 为 1–100；cursor 为正 BIGINT 字符串，避免浏览器精度损失。旧表没有时间字段，以最后一轮消息 ID 降序分页，不伪造历史日期。
+
+`GET /sessions/{id}` 按需读取完整问答，缺失返回 404。无 `view=summary` 的旧 `GET /sessions` 保持返回最近 50 条完整会话，兼容已有调用。摘要分页是一次聚合查询；正文搜索当前按字面扫描文本，历史量很大时需要评估全文索引。长期偏好可通过 /memories 的 GET、POST、PUT、DELETE 管理。
 
 以下端点无鉴权，默认只听 127.0.0.1：
+
+Codex 后端显式请求 `model_reasoning_summary="detailed"`，通过 `reasoning_delta` 转发模型实际返回的摘要。模型可能不提供摘要；聊天页生成期间展示等待状态，结束后提示“模型未提供思考摘要”，不会把等待提示当作模型思考内容。修改后需重启 Agent 服务。
 
 | 端点 | 行为 |
 |---|---|
@@ -98,6 +107,9 @@ stdout 只有答案（或 `--json` 的结果），工具调用清单、警告、
 | `GET /daily-reports/latest` | 读取最新一份每日复盘 |
 | `GET /daily-reports/{date}` | 读取指定交易日的复盘 |
 | `POST /daily-reports/{date}` | 生成或重新生成指定交易日的复盘 |
+| `POST /review-charts/{date}` | 校验同日收盘数据，返回全景图与完整梯队图 SVG base64，供定时推送使用；无模型调用 |
+
+收盘双图由 payback server 在交易日北京时间 15:38 触发，push-server 转成 PNG 后推送飞书和企微。此接口复用串行 MCP worker，避免与聊天并发争用标准输入输出；必需的大盘、短线、资金和梯队记录须为指定日 15:00 后的数据，否则返回 503。梯队的周期、封板率和涨跌停数使用本次短线原始快照；晋级率若没有同日收盘后的派生表记录则显示“未提供”。日期格式错误返回 400。返回结构为 `{data_as_of, charts: [{name: "panorama", svg_base64}, {name: "ladder", svg_base64}]}`。部署需同时更新三个服务，server 配置 `PAYBACK_AGENT_URL`，push-server 配置飞书图片上传应用凭据及中文字体。接口只允许可信本机或受保护内网调用，不要直接暴露公网。
 
 SSE 事件就是 `ask_events` 的事件流，外加两个服务级事件：
 
@@ -116,7 +128,7 @@ error        {"message"}                       本轮失败（会话历史保持
 实现要点（细节在 `serve.py` 模块 docstring）：单个 worker 任务独占 MCP 会话与网关
 client，请求只通过 memory channel 投递作业——anyio cancel scope 绝不跨 `yield`，
 客户端断连在 worker 的下一次事件发送处自然传播，丢弃本轮、会话不受污染。
-服务端将完成的问答和用户显式保存的长期偏好存入 MySQL。按 .env.example 配置专用的 AGENT_MEMORY_MYSQL_* 账号；账号需要目标数据库的 CREATE 权限，以及三张 agent_* 记忆表的 SELECT、INSERT、UPDATE、DELETE 权限。服务首次访问时创建表，行情 MCP 的只读账号和权限不受影响。上下文仍只携带最近 8 轮，工具原文不进入历史；前端保留本机聊天记录并恢复服务端会话。
+服务端将完成的问答和用户显式保存的长期偏好存入 MySQL。按 .env.example 配置专用的 AGENT_MEMORY_MYSQL_* 账号；账号需要目标数据库的 CREATE 权限，以及三张 agent_* 记忆表的 SELECT、INSERT、UPDATE、DELETE 权限。服务首次访问时创建表，行情 MCP 的只读账号和权限不受影响。上下文仍只携带最近 8 轮，工具原文不进入历史。前端首屏获取 30 条摘要，触底继续分页，点击后获取正文；可重新获取的正文最多缓存 5 个会话。localStorage 只保存最近摘要、活动入口和未同步内容，旧本机记录保守保留，不再新增即截断 50 条；本机空间不足时显示保存失败提示。升级需要同时更新前端并重启 Agent 服务，无数据库改表。
 
 升级时，如已有 SQLite 文件，应在新 MySQL 目标为空、启动 Agent 并写入新记录之前执行 uv run python -m payback_agent.migrate_memory [旧文件路径]。省略路径时优先读取旧 AGENT_MEMORY_PATH，否则使用 data/memory.sqlite3。迁移以事务写入且保留源文件，相同快照重复执行不会重复导入；目标已有数据时会拒绝导入，需先备份并人工处理。只有浏览器 localStorage 的旧记录不包含在此迁移中。
 

@@ -79,6 +79,45 @@ class MemoryStore:
             cursor.execute('INSERT INTO agent_conversation_turn(session_id, question, answer) '
                            'VALUES (%s, %s, %s)', (session_id, question, answer))
 
+    def session_page(self, limit: int, cursor: int | None, query: str) -> dict:
+        # 摘要通过一次聚合查询获取；游标用消息 ID，不加载正文也不依赖缺失的时间列。
+        needle = query.lower()
+        # 空查询只聚合索引字段；搜索词通过参数绑定，按字面匹配而非 LIKE 通配符。
+        # shortcut: 正文搜索扫描历史文本，历史规模导致延迟明显时升级全文索引。
+        match_sql = "MIN(CASE WHEN LOCATE(%s, LOWER(CONCAT(question, '\n', answer))) > 0 THEN id END)" if needle else 'NULL'
+        match_params = (needle,) if needle else ()
+        with self.connection() as conn, conn.cursor() as sql:
+            sql.execute('''
+                SELECT s.session_id, LEFT(first_turn.question, 24), s.last_id,
+                       CASE WHEN %s = '' THEN '' ELSE SUBSTRING(
+                           CONCAT(matched.question, '\n', matched.answer),
+                           GREATEST(1, LOCATE(%s, LOWER(CONCAT(matched.question, '\n', matched.answer))) - 40), 160)
+                       END
+                FROM (
+                    SELECT session_id, MIN(id) AS first_id, MAX(id) AS last_id,
+                           ''' + match_sql + ''' AS match_id
+                    FROM agent_conversation_turn
+                    GROUP BY session_id
+                    HAVING (%s = '' OR match_id IS NOT NULL)
+                       AND (%s IS NULL OR last_id < %s)
+                    ORDER BY last_id DESC LIMIT %s
+                ) s
+                JOIN agent_conversation_turn first_turn ON first_turn.id = s.first_id
+                LEFT JOIN agent_conversation_turn matched ON matched.id = s.match_id
+                ORDER BY s.last_id DESC
+            ''', (needle, needle, *match_params, needle, cursor, cursor, limit + 1))
+            return session_page_result(sql.fetchall(), limit)
+
+    def session_detail(self, session_id: str) -> dict | None:
+        with self.connection() as conn, conn.cursor() as cursor:
+            cursor.execute('SELECT question, answer FROM agent_conversation_turn '
+                           'WHERE session_id = %s ORDER BY id', (session_id,))
+            rows = cursor.fetchall()
+        if not rows:
+            return None
+        return {'id': session_id, 'messages': [item for question, answer in rows for item in (
+            {'role': 'user', 'content': question}, {'role': 'assistant', 'content': answer})]}
+
     def delete_session(self, session_id: str) -> bool:
         with self.connection() as conn, conn.cursor() as cursor:
             return bool(cursor.execute('DELETE FROM agent_conversation_turn WHERE session_id = %s',
@@ -110,6 +149,13 @@ class MemoryStore:
         with self.connection() as conn, conn.cursor() as cursor:
             return bool(cursor.execute('DELETE FROM agent_long_term_memory WHERE id = %s',
                                        (memory_id,)))
+
+
+def session_page_result(rows, limit: int) -> dict:
+    # BIGINT 作为字符串传输，防止浏览器丢失游标精度。
+    items = [{'id': row[0], 'title': row[1].strip() or '新对话',
+              'lastTurnId': str(row[2]), 'snippet': row[3] or ''} for row in rows[:limit]]
+    return {'items': items, 'nextCursor': items[-1]['lastTurnId'] if len(rows) > limit else None}
 
 
 def import_sqlite(store: MemoryStore, source) -> bool:

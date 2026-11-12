@@ -95,9 +95,9 @@ def max_turns() -> int:
     return value
 
 
-def create_llm_client():
+def create_llm_client(backend: str | None = None):
     """按配置选择模型后端，默认保持原网关行为。"""
-    backend = os.environ.get("AGENT_LLM_BACKEND", "gateway").strip().lower()
+    backend = (backend or os.environ.get("AGENT_LLM_BACKEND", "gateway")).strip().lower()
     if backend == "codex":
         from .codex import CodexClient
         return CodexClient()

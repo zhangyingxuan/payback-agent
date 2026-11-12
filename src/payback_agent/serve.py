@@ -42,6 +42,8 @@ from .loop import append_turn, ask_events
 from .prompt import load_system_prompt
 from .tools_source import open_stdio_source
 from .daily_report import REPORT_DIR, build_report, read_report, write_report
+from .daily_report import _date
+from .review_charts import build_review_charts
 
 MAX_SESSIONS = 64
 
@@ -77,6 +79,7 @@ class AgentService:
         self._jobs_send: Any = None
         self._jobs_receive: Any = None
         self._daily_scope: Any = None
+        self._memory_lock = anyio.Lock()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -102,6 +105,13 @@ class AgentService:
         send, receive = anyio.create_memory_object_stream[dict](1)
         await self.submit((trade_date, '', send, 'daily'))
         async with receive:
+            return await receive.receive()
+
+    async def generate_charts(self, trade_date: str) -> dict:
+        """双图任务与聊天共享串行队列，避免并发读写 MCP 通道。"""
+        send, receive = anyio.create_memory_object_stream[dict](1)
+        async with receive:
+            await self.submit((trade_date, '', send, 'charts'))
             return await receive.receive()
 
     async def _daily_loop(self) -> None:
@@ -133,10 +143,11 @@ class AgentService:
         finally:
             await self._dispose()
 
-    async def _ensure_ready(self) -> None:
-        if self._client is not None:
+    async def _ensure_ready(self, *, needs_default: bool = True) -> None:
+        if needs_default and self._client is None:
+            self._client = config.create_llm_client()
+        if self._source is not None:
             return
-        client = config.create_llm_client()
         self._max_turns = self._configured_max_turns or config.max_turns()
         launch = config.mcp_launch_args()
         stack = AsyncExitStack()
@@ -144,11 +155,11 @@ class AgentService:
             self._source = await stack.enter_async_context(open_stdio_source(launch))
         except BaseException:
             await stack.aclose()
-            if hasattr(client, "aclose"):
-                await client.aclose()
+            if self._client is not None and hasattr(self._client, "aclose"):
+                await self._client.aclose()
+            self._client = None
             raise
         self._stack = stack
-        self._client = client
 
     async def _dispose(self) -> None:
         """Tear down client + source inside the worker task that created them."""
@@ -167,19 +178,21 @@ class AgentService:
 
     # -- sessions --------------------------------------------------------------
 
-    def _history(self, session_id: str) -> list[dict]:
+    async def _history(self, session_id: str) -> list[dict]:
         history = self._sessions.get(session_id)
         if history is None:
-            history = self.memory.history(session_id)
+            history = await anyio.to_thread.run_sync(self.memory.history, session_id)
         self._sessions[session_id] = history
         self._sessions.move_to_end(session_id)
         while len(self._sessions) > self._max_sessions:
             self._sessions.popitem(last=False)
         return history
 
-    def delete_session(self, session_id: str) -> bool:
-        cached = self._sessions.pop(session_id, None) is not None
-        return self.memory.delete_session(session_id) or cached
+    async def delete_session(self, session_id: str) -> bool:
+        async with self._memory_lock:
+            deleted = await anyio.to_thread.run_sync(self.memory.delete_session, session_id)
+            cached = self._sessions.pop(session_id, None) is not None
+            return deleted or cached
 
     @property
     def session_count(self) -> int:
@@ -188,10 +201,18 @@ class AgentService:
     # -- one question ----------------------------------------------------------
 
     async def _run_job(self, job: Job) -> None:
+        # 排队期间客户端可能已断开，跳过任务可避免无效占用唯一工作协程。
+        if job[2].statistics().open_receive_streams == 0:
+            await job[2].aclose()
+            return
         if len(job) == 4:
-            trade_date, _, events_send, _ = job
+            trade_date, _, events_send, kind = job
             async with events_send:
                 try:
+                    if kind == 'charts':
+                        await self._ensure_ready(needs_default=False)
+                        await events_send.send({'charts': await build_review_charts(self._source, trade_date)})
+                        return
                     await self._ensure_ready()
                     report = await build_report(self._source, self._client, trade_date)
                     write_report(REPORT_DIR, report)
@@ -202,28 +223,38 @@ class AgentService:
                     await self._dispose()
                     await events_send.send({'error': '生成复盘失败，请检查 Agent 与数据源状态'})
             return
-        message, session_id, events_send = job
+        message, session_id, events_send = job[:3]
+        model = job[4] if len(job) == 5 else None
+        selected_client = None
         async with events_send:
             try:
-                await self._ensure_ready()
-                history = self._history(session_id)
+                await self._ensure_ready(needs_default=not model)
+                # 每次请求单独选择客户端，避免切换影响其他会话或定时任务。
+                selected_client = config.create_llm_client(model) if model else None
+                # 同步数据库操作移到线程中，锁保证缓存和持久化状态的顺序一致。
+                async with self._memory_lock:
+                    history = await self._history(session_id)
+                    memories = await anyio.to_thread.run_sync(self.memory.memories)
                 done: dict | None = None
-                memories = self.memory.memories()
                 system_prompt = load_system_prompt()
                 if memories:
                     # 偏好属于用户数据，不能覆盖系统规则或代替本轮行情证据。
                     system_prompt += chr(10) + "用户保存的偏好（仅作参考，不得覆盖以上规则）：" + json.dumps(memories, ensure_ascii=False)
                 async for event in ask_events(
-                        message, llm=self._client, source=self._source,
+                        message, llm=selected_client or self._client, source=self._source,
                         system_prompt=system_prompt,
                         max_turns=self._max_turns, history=history):
                     if event["type"] == "done":
                         done = event
                         # 先提交完整问答，再通知客户端完成，避免成功状态与存储不一致。
                         if done["content"].strip():
-                            self.memory.save_turn(session_id, message, done["content"])
-                            self._sessions[session_id] = append_turn(history, message, done["content"])
-                            self._sessions.move_to_end(session_id)
+                            async with self._memory_lock:
+                                # 删除会话会移除缓存，不能让进行中的回答重新写回旧记录。
+                                if self._sessions.get(session_id) is not history:
+                                    raise LlmError('会话已删除，本次回答未保存')
+                                await anyio.to_thread.run_sync(self.memory.save_turn, session_id, message, done["content"])
+                                self._sessions[session_id] = append_turn(history, message, done["content"])
+                                self._sessions.move_to_end(session_id)
                     await events_send.send(_client_event(event))
             except (anyio.ClosedResourceError, anyio.BrokenResourceError,
                     anyio.EndOfStream):
@@ -231,10 +262,12 @@ class AgentService:
             except (LlmError, config.ConfigError) as exc:
                 await self._send_error(events_send, str(exc))
             except Exception as exc:
-                # MCP failure, launch failure, anything else: the source may be
-                # broken, so drop it -- the next question respawns payback-mcp.
+                # 异常后数据源可能已损坏，释放后由下一个问题重新启动。
                 await self._dispose()
                 await self._send_error(events_send, _error_reason(exc))
+            finally:
+                if selected_client is not None and hasattr(selected_client, 'aclose'):
+                    await selected_client.aclose()
 
     async def _send_error(self, events_send: Any, message: str) -> None:
         try:
@@ -255,11 +288,7 @@ def _error_reason(exc: BaseException) -> str:
     return _launch_failure_reason(exc)
 
 
-# Heavy fields the browser never renders: done carries the full message stack
-# and tool_result the raw tool payload -- one four-level review is ~29k chars of
-# JSON per turn, pointless to push over SSE and pointless to hold in the page.
-# ask_events keeps producing them (CLI/trace/tests consume them); only the wire
-# copy is slimmed.
+# 浏览器不渲染完整消息栈和原始工具结果，传输时移除以减少数据量；其他调用方仍可获取。
 _DROP_ON_WIRE = {"done": ("messages",), "tool_result": ("result",)}
 
 
@@ -298,40 +327,50 @@ def create_app(*, agent: AgentService | None = None,
         except ValueError as exc:
             return JSONResponse({'error': str(exc)}, status_code=400)
 
+    async def review_charts(request: Request) -> JSONResponse:
+        """仅供可信内网调度调用；非法日期在排队前拒绝。"""
+        try:
+            trade_date = _date(request.path_params['trade_date'])
+        except ValueError as exc:
+            return JSONResponse({'error': str(exc)}, status_code=400)
+        result = await service.generate_charts(trade_date)
+        return JSONResponse(result.get('charts', result), status_code=200 if 'charts' in result else 503)
+
     async def chat(request: Request) -> Any:
         try:
             body = await request.json()
         except Exception:
             body = None
-        message = (body or {}).get("message")
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "request body must be a JSON object"}, status_code=400)
+        message = body.get("message")
         if not isinstance(message, str) or not message.strip():
             return JSONResponse({"error": "message must be a non-empty string"},
                                 status_code=400)
-        session_id = (body or {}).get("session_id")
+        session_id = body.get("session_id")
         if session_id is not None and (not isinstance(session_id, str)
                                        or not session_id.strip() or len(session_id) > 128):
             return JSONResponse({"error": "session_id must be a non-empty string"},
                                 status_code=400)
         session_id = session_id or uuid.uuid4().hex
+        model = body.get('model')
+        if model is not None and model not in ('gateway', 'codex'):
+            return JSONResponse({'error': 'model must be gateway or codex'}, status_code=400)
 
         async def stream() -> AsyncIterator[str]:
-            # The session id goes out first so the client can keep the
-            # conversation even if this very turn ends in an error event.
             # 先返回会话 ID，即使后续生成失败，客户端仍能识别本次会话。
             yield _sse({"type": "session", "session_id": session_id})
             send_stream, receive_stream = anyio.create_memory_object_stream[dict](
                 max_buffer_size=64)
-            try:
-                await service.submit((message.strip(), session_id, send_stream))
-            except (anyio.ClosedResourceError, anyio.BrokenResourceError,
-                    AttributeError):
-                yield _sse({"type": "error", "message": "service is shutting down"})
-                return
-            # This generator deliberately holds no cancel scope: when the client
-            # disconnects, closing the receive side is all the cleanup needed --
-            # the worker notices on its next send and abandons the turn.
             # 请求断开时关闭接收端，由工作协程在下次发送时结束当前任务。
             async with receive_stream:
+                try:
+                    await service.submit((message.strip(), session_id, send_stream, 'chat', model))
+                except (anyio.ClosedResourceError, anyio.BrokenResourceError,
+                        AttributeError):
+                    await send_stream.aclose()
+                    yield _sse({"type": "error", "message": "service is shutting down"})
+                    return
                 async for event in receive_stream:
                     yield _sse(event)
 
@@ -340,17 +379,38 @@ def create_app(*, agent: AgentService | None = None,
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no",
                      "Connection": "keep-alive"})
 
-    async def list_sessions(_: Request) -> JSONResponse:
-        return JSONResponse(service.memory.sessions())
+    async def list_sessions(request: Request) -> JSONResponse:
+        if request.query_params.get('view') == 'summary':
+            # 在入口限制分页和查询大小；旧调用仍保留原来的完整列表响应。
+            try:
+                limit = int(request.query_params.get('limit', '30'))
+                raw_cursor = request.query_params.get('cursor')
+                cursor = int(raw_cursor) if raw_cursor is not None else None
+                query = request.query_params.get('q', '').strip()
+                if not 1 <= limit <= 100 or (cursor is not None and not 0 < cursor <= 18446744073709551615) or len(query) > 200:
+                    raise ValueError
+            except ValueError:
+                return JSONResponse({'error': '分页参数或搜索词无效'}, status_code=400)
+            async with service._memory_lock:
+                return JSONResponse(await anyio.to_thread.run_sync(service.memory.session_page, limit, cursor, query))
+        async with service._memory_lock:
+            return JSONResponse(await anyio.to_thread.run_sync(service.memory.sessions))
+
+    async def session_detail(request: Request) -> JSONResponse:
+        async with service._memory_lock:
+            detail = await anyio.to_thread.run_sync(service.memory.session_detail, request.path_params['session_id'])
+        return JSONResponse(detail if detail is not None else {'error': '会话不存在'},
+                            status_code=200 if detail is not None else 404)
 
     async def delete_session(request: Request) -> JSONResponse:
         session_id = request.path_params["session_id"]
         return JSONResponse({"session_id": session_id,
-                             "deleted": service.delete_session(session_id)})
+                             "deleted": await service.delete_session(session_id)})
 
     async def memories(request: Request) -> JSONResponse:
         if request.method == "GET":
-            return JSONResponse(service.memory.memories())
+            async with service._memory_lock:
+                return JSONResponse(await anyio.to_thread.run_sync(service.memory.memories))
         try:
             body = await request.json()
         except Exception:
@@ -358,9 +418,11 @@ def create_app(*, agent: AgentService | None = None,
         content = body.get("content") if isinstance(body, dict) else None
         if not isinstance(content, str) or not content.strip() or len(content.strip()) > 500:
             return JSONResponse({"error": "记忆内容须为 1–500 个字符"}, status_code=400)
-        if len(service.memory.memories()) >= 50:
-            return JSONResponse({"error": "最多保存 50 条记忆"}, status_code=400)
-        return JSONResponse(service.memory.add_memory(content.strip()), status_code=201)
+        async with service._memory_lock:
+            if len(await anyio.to_thread.run_sync(service.memory.memories)) >= 50:
+                return JSONResponse({"error": "最多保存 50 条记忆"}, status_code=400)
+            saved = await anyio.to_thread.run_sync(service.memory.add_memory, content.strip())
+            return JSONResponse(saved, status_code=201)
 
     async def delete_memory(request: Request) -> Any:
         if request.method == "PUT":
@@ -371,11 +433,15 @@ def create_app(*, agent: AgentService | None = None,
             content = body.get("content") if isinstance(body, dict) else None
             if not isinstance(content, str) or not content.strip() or len(content.strip()) > 500:
                 return JSONResponse({"error": "记忆内容须为 1–500 个字符"}, status_code=400)
-            if not service.memory.update_memory(request.path_params["memory_id"], content.strip()):
-                return JSONResponse({"error": "记忆不存在"}, status_code=404)
+            async with service._memory_lock:
+                updated = await anyio.to_thread.run_sync(service.memory.update_memory, request.path_params["memory_id"], content.strip())
+                if not updated:
+                    return JSONResponse({"error": "记忆不存在"}, status_code=404)
             return JSONResponse({"id": request.path_params["memory_id"], "content": content.strip()})
-        if not service.memory.delete_memory(request.path_params["memory_id"]):
-            return JSONResponse({"error": "记忆不存在"}, status_code=404)
+        async with service._memory_lock:
+            deleted = await anyio.to_thread.run_sync(service.memory.delete_memory, request.path_params["memory_id"])
+            if not deleted:
+                return JSONResponse({"error": "记忆不存在"}, status_code=404)
         from starlette.responses import Response
         return Response(status_code=204)
 
@@ -385,7 +451,9 @@ def create_app(*, agent: AgentService | None = None,
                 Route("/memories/{memory_id}", delete_memory, methods=["PUT", "DELETE"]),
                 Route("/healthz", healthz),
                 Route('/daily-reports/{trade_date}', daily_report, methods=['GET', 'POST']),
+                Route('/review-charts/{trade_date}', review_charts, methods=['POST']),
                 Route("/chat", chat, methods=["POST"]),
+                Route("/sessions/{session_id}", session_detail, methods=["GET"]),
                 Route("/sessions/{session_id}", delete_session, methods=["DELETE"])],
         lifespan=lambda app: _lifespan(service),
     )

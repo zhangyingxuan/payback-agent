@@ -10,9 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-# (tool, extra args) in the order the reasoning chain consumes them:
-# ① environment -> ② phase -> ③ position -> ④ conditional regime match, then the
-# ladder detail that ④'s tradability statements need.
+# 按推理顺序获取环境、阶段、位置、相似情景，以及可交易性所需的梯队明细。
 STEPS: tuple[tuple[str, dict], ...] = (
     ("get_market_overview", {}),
     ("get_limit_up_structure", {}),
@@ -27,8 +25,7 @@ def _payload(text: str) -> Any:
     try:
         return json.loads(text)
     except ValueError:
-        # Not JSON means the transport or a legacy tool broke the contract; say so
-        # in the payload rather than raising out of a dry run.
+        # 非 JSON 表示传输或旧工具不符合契约；返回错误，避免试运行中断。
         return {"error": "tool result is not JSON", "raw": text[:400]}
 
 

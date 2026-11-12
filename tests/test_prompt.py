@@ -36,7 +36,7 @@ def test_the_shipped_prompt_locks_the_four_levels_and_the_disclaimer():
                        "万亿元", "`null` ≠ `0`", "features_compared", "条件统计",
                        "open_times", "turnover_type", "上一轮的数字不是本轮的数据源"):
         assert discipline in text, discipline
-    for boundary in ("不构成投资建议", "不推荐个股", "不给仓位"):
+    for boundary in ("不构成投资建议", "不是荐股", "不提供确定性买卖指令或仓位比例"):
         assert boundary in text
 
 
