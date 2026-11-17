@@ -124,9 +124,9 @@ def test_same_day_snapshot_is_shown_without_claiming_current_completion():
     source = FakeSource({'get_daily_panorama': json.dumps(snapshot)})
     events = _events('生成今日复盘全景图', FakeLlm({'role': 'assistant', 'content': '市场强势'}), source)
     content = events[-1]['content']
-    assert '无法判断当前盘面' in content
+    assert content.startswith('市场强势')
+    assert '不可据此认定为实时或完整收盘数据' in content
     assert '3,000' in content and '1,800' in content
-    assert '市场强势' not in content
     assert 'data:image/svg+xml;base64,' in content
 
 

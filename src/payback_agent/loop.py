@@ -292,7 +292,7 @@ async def ask_events(
                 if trace is not None:
                     await trace.write({**record, 'type': 'tool_call'})
                 yield record
-            # 先核对证据再展示正文，避免未经核验的数字在流式输出中短暂出现。
+            # 数据缺失只追加适用边界，不整段覆盖回答，以保留通用解释和已取得的有效信息。
             requested_code = re.search(r'(?<!\d)\d{6}(?!\d)', question)
             # 涉及具体个股的次日操作或走势必须有同一标的证据，不能仅凭模型记忆作答。
             stock_plan = bool(re.search(r'支撑|压力|个股.*预案|\d{6}.*预案', question)) or bool(
@@ -312,9 +312,11 @@ async def ask_events(
                 or bool(failed.get('get_stock_review'))
                 or bool(requested_code and not stock_code.startswith(requested_code.group()))
             )
-            if stock_missing or ((not evidence or failed) and (re.search(r'\d', content) or re.search(r'行情|复盘|涨停|跌停|出手|市场', question))):
-                content = "证据不足：本轮数据缺失或查询失败，无法判断。"
             notes = []
+            if stock_missing:
+                notes.append("未取得匹配的个股数据，具体价位和个股判断尚未核实，可讨论一般分析方法与条件预案。")
+            if not evidence and re.search(r'行情|复盘|涨停|跌停|出手|市场', question):
+                notes.append("未取得本轮行情数据，以下仅作一般讨论，不代表已核实的行情事实。")
             if failed:
                 notes.append("部分数据查询失败或缺失：" + "、".join(failed))
             dates = {day for _, day in dated_evidence}
@@ -337,19 +339,9 @@ async def ask_events(
             explicit_date = re.search(r'(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)', question)
             usable_snapshot = snapshot and "get_daily_panorama" not in failed and (
                 explicit_date is None or snapshot.get("data_as_of") == explicit_date.group())
-            snapshot_summary_added = False
             if today in dates:
-                if not future_plan and not snapshot_comparison and re.search(r'今天|今日|现在|当前|盘中|出手', question):
-                    content = "证据不足：当日数据的完成状态未知，无法判断当前盘面。"
-                    if usable_snapshot and snapshot.get('data_as_of') == today:
-                        # 仍保留未完成数据的事实快照，但不采用模型对当下盘面的判断。
-                        summary = panorama_summary(snapshot)
-                        if summary:
-                            content += "\n\n" + summary
-                            snapshot_summary_added = True
                 notes.append("当日数据的收盘完成状态和原始数据更新时间未知，不可据此认定为实时或完整收盘数据。")
             elif dates and not future_plan and re.search(r'今天|今日|现在|当前|盘中|出手', question):
-                content = "证据不足：历史数据不能用于判断当前盘面。"
                 notes.append("所用数据并非今日数据，无法据此判断当前盘面；原始数据更新时间未知。")
             if notes:
                 content = content.strip() + "\n\n数据提示：" + "；".join(notes)
@@ -383,10 +375,9 @@ async def ask_events(
                     pass
                 chart = panorama_markdown(snapshot, analysis)
                 if chart:
-                    if not snapshot_summary_added:
-                        summary = panorama_summary(snapshot)
-                        if summary:
-                            content = content.strip() + "\n\n" + summary
+                    summary = panorama_summary(snapshot)
+                    if summary:
+                        content = content.strip() + "\n\n" + summary
                     content = content.strip() + "\n\n" + chart
             # 只附加成功且符合指定日期的本轮梯队，不能用其他日期冒充请求日。
             ladder = evidence.get('get_even_board_ladder')

@@ -224,6 +224,8 @@ class AgentService:
                     await events_send.send({'error': '生成复盘失败，请检查 Agent 与数据源状态'})
             return
         message, session_id, events_send = job[:3]
+        # 使用服务端时间保存本轮开始和回复完成时刻，刷新后仍可展示同一时间。
+        asked_at = int(datetime.now(timezone.utc).timestamp() * 1000)
         model = job[4] if len(job) == 5 else None
         selected_client = None
         async with events_send:
@@ -252,7 +254,10 @@ class AgentService:
                                 # 删除会话会移除缓存，不能让进行中的回答重新写回旧记录。
                                 if self._sessions.get(session_id) is not history:
                                     raise LlmError('会话已删除，本次回答未保存')
-                                await anyio.to_thread.run_sync(self.memory.save_turn, session_id, message, done["content"])
+                                answered_at = int(datetime.now(timezone.utc).timestamp() * 1000)
+                                await anyio.to_thread.run_sync(self.memory.save_turn, session_id, message, done["content"], asked_at, answered_at)
+                                done['questionCreatedAt'] = asked_at
+                                done['createdAt'] = answered_at
                                 self._sessions[session_id] = append_turn(history, message, done["content"])
                                 self._sessions.move_to_end(session_id)
                     await events_send.send(_client_event(event))

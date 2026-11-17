@@ -73,6 +73,18 @@ def _answer(text):
     return {"role": "assistant", "content": text}
 
 
+def test_chat_timestamps_match_reloaded_messages():
+    app, _, _ = _app(_answer('你好'))
+    with TestClient(app) as client:
+        events = _events(client.post('/chat', json={'message': '你好'}))
+        done = events[-1]
+        assert 0 < done['questionCreatedAt'] <= done['createdAt']
+        session_id = events[0]['session_id']
+        messages = client.get('/sessions/' + session_id).json()['messages']
+        assert [message['createdAt'] for message in messages] == [
+            done['questionCreatedAt'], done['createdAt']]
+
+
 def test_chat_selects_backend_per_request_and_rejects_unknown(monkeypatch):
     from payback_agent import config
     app, default, _ = _app(_answer('默认'), _answer('恢复默认'))
@@ -142,8 +154,9 @@ def test_chat_streams_session_then_the_loop_events():
     kinds = [e["type"] for e in events]
     assert kinds == ["session", "delta", "done"]
     assert events[0]["session_id"]
-    assert "证据不足" in events[1]["text"]
-    assert "证据不足" in events[2]["content"]
+    assert events[1]["text"].startswith("涨停 42 家")
+    assert "未取得本轮行情数据" in events[1]["text"]
+    assert events[2]["content"] == events[1]["text"]
     assert events[2]["usage"]["total_tokens"] == 15
 
 
@@ -154,7 +167,7 @@ def test_a_returned_session_id_carries_the_visible_history():
         session_id = first[0]["session_id"]
         second = _events(client.post(
             "/chat", json={"message": "那二板呢", "session_id": session_id}))
-    assert "证据不足" in second[-1]["content"]
+    assert second[-1]["content"] == "二板晋级率 17%"
     assert [m["role"] for m in llm.requests[1]] == ["system", "user", "assistant", "user"]
     assert llm.requests[1][3]["content"] == "那二板呢"
     # and the tool result of turn one is NOT replayed, per append_turn's contract

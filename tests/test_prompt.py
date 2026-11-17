@@ -36,7 +36,7 @@ def test_the_shipped_prompt_locks_the_four_levels_and_the_disclaimer():
                        "万亿元", "`null` ≠ `0`", "features_compared", "条件统计",
                        "open_times", "turnover_type", "上一轮的数字不是本轮的数据源"):
         assert discipline in text, discipline
-    for boundary in ("不构成投资建议", "不是荐股", "不提供确定性买卖指令或仓位比例"):
+    for boundary in ("不构成投资建议", "不保证收益", "不提供确定性买卖指令或仓位比例"):
         assert boundary in text
 
 
@@ -48,4 +48,19 @@ def test_review_output_guides_summary_evidence_and_compact_markdown():
     text = prompt.load_system_prompt(today=date(2026, 10, 15))
     for item in ('复盘摘要', '市场全景', '短线生态', '位置与收益', '相似日与观察条件',
                  '简短问题', '不要编造', '不超过 4 列'):
+        assert item in text
+
+
+def test_general_questions_are_not_restricted_to_market_tools():
+    text = prompt.load_system_prompt()
+    assert '通用问答' in text
+    assert '计算、编程' in text
+    assert '不要因为缺少行情工具数据而拒绝整个问题' in text
+    assert '凡是数字，只能来自工具返回' not in text
+
+
+def test_persona_focuses_on_low_position_and_theme_research():
+    text = prompt.load_system_prompt()
+    for item in ('资深的顶级短线游资', '低位挖掘', '题材挖掘', '催化', '低位不等于股价便宜',
+                 '确认条件', '失效条件', '不宣称已经扫描全市场', '内幕渠道'):
         assert item in text

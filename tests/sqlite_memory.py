@@ -15,7 +15,8 @@ class MemoryStore:
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS turns (
                 id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
-                question TEXT NOT NULL, answer TEXT NOT NULL
+                question TEXT NOT NULL, answer TEXT NOT NULL,
+                question_created_at INTEGER, answer_created_at INTEGER
             );
             CREATE INDEX IF NOT EXISTS turns_session ON turns(session_id, id);
             CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, content TEXT NOT NULL);
@@ -45,10 +46,12 @@ class MemoryStore:
             result.append({'id': session_id, 'messages': messages})
         return result
 
-    def save_turn(self, session_id: str, question: str, answer: str) -> None:
+    def save_turn(self, session_id: str, question: str, answer: str,
+                  question_created_at: int | None = None, answer_created_at: int | None = None) -> None:
         with self.db:
-            self.db.execute('INSERT INTO turns(session_id, question, answer) VALUES (?, ?, ?)',
-                            (session_id, question, answer))
+            self.db.execute('INSERT INTO turns(session_id, question, answer, question_created_at, answer_created_at) '
+                            'VALUES (?, ?, ?, ?, ?)',
+                            (session_id, question, answer, question_created_at, answer_created_at))
 
     def session_page(self, limit: int, cursor: int | None, query: str) -> dict:
         from payback_agent.memory import session_page_result
@@ -69,12 +72,13 @@ class MemoryStore:
         return session_page_result(rows, limit)
 
     def session_detail(self, session_id: str) -> dict | None:
-        rows = self.db.execute('SELECT question, answer FROM turns WHERE session_id = ? ORDER BY id',
+        rows = self.db.execute('SELECT question, answer, question_created_at, answer_created_at FROM turns WHERE session_id = ? ORDER BY id',
                                (session_id,)).fetchall()
         if not rows:
             return None
-        return {'id': session_id, 'messages': [item for question, answer in rows for item in (
-            {'role': 'user', 'content': question}, {'role': 'assistant', 'content': answer})]}
+        return {'id': session_id, 'messages': [item for question, answer, asked_at, answered_at in rows for item in (
+            {'role': 'user', 'content': question, 'createdAt': asked_at},
+            {'role': 'assistant', 'content': answer, 'createdAt': answered_at})]}
 
     def delete_session(self, session_id: str) -> bool:
         with self.db:

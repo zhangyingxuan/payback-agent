@@ -5,6 +5,31 @@ import pytest
 from payback_agent import config
 
 
+def test_message_timestamps_persist_and_legacy_remains_unknown():
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock
+    from payback_agent.memory import MemoryStore
+    store = MemoryStore()
+    cursor = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cursor
+
+    @contextmanager
+    def connection():
+        yield conn
+
+    store.connection = connection
+    cursor.lastrowid = 12
+    store.save_turn('session', '问题', '答案', 1794826801000, 1794826805000)
+    assert cursor.execute.call_args_list[0].args[1] == ('session', '问题', '答案')
+    assert cursor.execute.call_args.args[1] == (12, 1794826801000, 1794826805000)
+    cursor.fetchall.return_value = [('问题', '答案', 1794826801000, 1794826805000),
+                                   ('旧问题', '旧答案', None, None)]
+    messages = store.session_detail('session')['messages']
+    assert [message['createdAt'] for message in messages] == [
+        1794826801000, 1794826805000, None, None]
+
+
 def test_memory_database_requires_dedicated_credentials(monkeypatch):
     for name in ('HOST', 'PORT', 'USER', 'PASSWORD', 'NAME'):
         monkeypatch.delenv('AGENT_MEMORY_MYSQL_' + name, raising=False)

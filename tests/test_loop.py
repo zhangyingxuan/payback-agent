@@ -91,7 +91,8 @@ def test_plain_answer_never_touches_a_tool():
     llm = FakeLlm({"role": "assistant", "content": "涨停 42 家（2026-10-13）"})
     source = FakeSource()
     answer = _ask("昨天涨停几家", llm, source)
-    assert "证据不足" in answer.content
+    assert answer.content.startswith("涨停 42 家")
+    assert "未取得本轮行情数据" in answer.content
     assert answer.iterations == 1 and answer.tool_calls == [] and not answer.truncated
     assert source.calls == []
     # system + user only; nothing invented was pushed onto the stack
@@ -316,9 +317,10 @@ def test_ask_events_streams_deltas_then_exactly_one_done():
     events = _events("昨天涨停几家", llm, FakeSource())
     kinds = [e["type"] for e in events]
     assert kinds == ["delta", "done"]
-    assert "证据不足" in events[0]["text"]
+    assert events[0]["text"].startswith("42 家")
+    assert "未取得本轮行情数据" in events[0]["text"]
     done = events[-1]
-    assert "证据不足" in done["content"]
+    assert done["content"] == events[0]["text"]
     assert done["iterations"] == 1 and done["truncated"] is False
     assert done["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     assert [m["role"] for m in done["messages"]] == ["system", "user"]
@@ -349,7 +351,8 @@ def test_ask_events_falls_back_to_chat_as_one_delta_per_iteration():
     llm = FakeLlm({"role": "assistant", "content": "42 家"})
     events = _events("昨天涨停几家", llm, FakeSource())
     assert [e["type"] for e in events] == ["delta", "done"]
-    assert "证据不足" in events[0]["text"]
+    assert events[0]["text"].startswith("42 家")
+    assert "未取得本轮行情数据" in events[0]["text"]
 
 
 def test_ask_events_delta_carries_the_iteration_and_done_keeps_the_last_nonempty_one():

@@ -117,5 +117,5 @@ def test_daily_report_prompt_requests_readable_plain_text_and_quote_timestamps()
     llm = RecordingLlm()
     anyio.run(build_report, Source(), llm, '2026-10-13')
     instructions = llm.messages[0]['content']
-    for item in ('纯文本', '市场概览', '板块与梯队', '风险观察', '报价时间', '不是历史交易日'):
+    for item in ('纯文本', '市场概览', '板块与梯队', '风险观察', '报价时间', '不是历史交易日', '320 字', '四行', '不要复述', '结论：'):
         assert item in instructions

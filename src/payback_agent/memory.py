@@ -33,6 +33,11 @@ class MemoryStore:
                         question MEDIUMTEXT NOT NULL, answer MEDIUMTEXT NOT NULL,
                         INDEX idx_agent_turn_session (session_id, id)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4''')
+                    # 独立保存时间以兼容无 ALTER 权限的账号，历史记录不回填虚构时间。
+                    cursor.execute('''CREATE TABLE IF NOT EXISTS agent_conversation_turn_time (
+                        turn_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                        question_created_at BIGINT NULL, answer_created_at BIGINT NULL
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4''')
                     cursor.execute('''CREATE TABLE IF NOT EXISTS agent_long_term_memory (
                         seq BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
                         id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL UNIQUE,
@@ -74,10 +79,15 @@ class MemoryStore:
                 result.append({'id': session_id, 'messages': messages})
             return result
 
-    def save_turn(self, session_id: str, question: str, answer: str) -> None:
+    def save_turn(self, session_id: str, question: str, answer: str,
+                  question_created_at: int | None = None, answer_created_at: int | None = None) -> None:
         with self.connection() as conn, conn.cursor() as cursor:
             cursor.execute('INSERT INTO agent_conversation_turn(session_id, question, answer) '
                            'VALUES (%s, %s, %s)', (session_id, question, answer))
+            # 与正文处于同一事务，避免回答保存成功却丢失时间。
+            cursor.execute('INSERT INTO agent_conversation_turn_time '
+                           '(turn_id, question_created_at, answer_created_at) VALUES (%s, %s, %s)',
+                           (cursor.lastrowid, question_created_at, answer_created_at))
 
     def session_page(self, limit: int, cursor: int | None, query: str) -> dict:
         # 摘要通过一次聚合查询获取；游标用消息 ID，不加载正文也不依赖缺失的时间列。
@@ -110,16 +120,22 @@ class MemoryStore:
 
     def session_detail(self, session_id: str) -> dict | None:
         with self.connection() as conn, conn.cursor() as cursor:
-            cursor.execute('SELECT question, answer FROM agent_conversation_turn '
-                           'WHERE session_id = %s ORDER BY id', (session_id,))
+            cursor.execute('SELECT t.question, t.answer, stamp.question_created_at, stamp.answer_created_at '
+                           'FROM agent_conversation_turn t LEFT JOIN agent_conversation_turn_time stamp ON stamp.turn_id = t.id '
+                           'WHERE t.session_id = %s ORDER BY t.id', (session_id,))
             rows = cursor.fetchall()
         if not rows:
             return None
-        return {'id': session_id, 'messages': [item for question, answer in rows for item in (
-            {'role': 'user', 'content': question}, {'role': 'assistant', 'content': answer})]}
+        return {'id': session_id, 'messages': [item for question, answer, asked_at, answered_at in rows for item in (
+            {'role': 'user', 'content': question, 'createdAt': asked_at},
+            {'role': 'assistant', 'content': answer, 'createdAt': answered_at})]}
 
     def delete_session(self, session_id: str) -> bool:
         with self.connection() as conn, conn.cursor() as cursor:
+            # 删除正文前清理对应时间，避免删除会话后留下孤立元数据。
+            cursor.execute('DELETE stamp FROM agent_conversation_turn_time stamp '
+                           'JOIN agent_conversation_turn t ON t.id = stamp.turn_id WHERE t.session_id = %s',
+                           (session_id,))
             return bool(cursor.execute('DELETE FROM agent_conversation_turn WHERE session_id = %s',
                                        (session_id,)))
 
