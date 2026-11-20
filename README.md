@@ -87,6 +87,46 @@ stdout 只有答案（或 `--json` 的结果），工具调用清单、警告、
 
 ## serve 模式（网页对接）
 
+### 可选：受控研究首批能力
+
+现有行情工具不支持的问题，可通过独立研究队列搜索公开文档、读取公开 HTTPS 文本，调用管理员预登记的只读 API，并可在配置固定镜像后执行隔离 Python 统计。默认关闭；仅在可信本机或已保护的网关后启用。不在宿主执行模型代码，没有自动安装、自动注册 MCP 或写业务系统能力。
+
+```ini
+AGENT_RESEARCH_ENABLED=true
+# 以下两项可省略：不配置来源文件时仍可读取公开文档，有搜索 Key 时可搜索。
+AGENT_RESEARCH_SOURCES=D:/workspace/github/payback-all/payback-agent/research-sources.local.json
+AGENT_RESEARCH_DIR=D:/workspace/github/payback-all/payback-agent/data/research
+AGENT_RESEARCH_BRAVE_API_KEY=<已有 Brave Search API Key>
+# 可选：没有此项时取数仍可用，Python 明确拒绝执行。
+AGENT_RESEARCH_PYTHON_IMAGE=sha256:<管理员已审核的64位本地镜像ID>
+```
+
+复制 `research-sources.example.json` 到已忽略的 `research-sources.local.json` 后由管理员编辑；示例使用 [Brave 官方文档](https://api-dashboard.search.brave.com/api-reference/web/search/get) 已公开的只读搜索接口。来源 JSON 的 key 是来源 ID，每项固定 origin、可选 auth、operations。操作仅支持固定 path、GET 查询参数或 POST JSON 标量参数，必须由管理员确认 `read_only: true`；该声明不是自动判断远端无副作用的证明。参数支持 string/integer/number/boolean、required、max_length、minimum、maximum，其他 JSON Schema 能力不在首批范围。
+
+模型只看到允许操作与参数，不接收密钥。每次执行重读来源文件，公开 fetch 不发送鉴权头；带凭据请求只发往来源固定地址，不跟随重定向、不使用系统代理。DNS 所有地址均须公网，连接固定到已检查的 IP，TLS 按原域名验证。响应仅允许文本/JSON/CSV、256 KiB，连接超时 10 秒、读取循环预算 20 秒；DNS 解析超时仍由操作系统决定。所有网络操作均不自动重试。
+
+工具顺序为 `research_sources` → `research_start` → `research_status` → `research_result`；取消用 `research_cancel`。通用取数每次仅发一个请求；爱问财专用查询可显式设置有界分页。仍在运行时给用户 task_id，不忙轮询；下一轮可按 ID 获取结果。succeeded 只表示取数完成，解析条件、日期、复权和覆盖范围仍需领域验证。
+
+A 股已内置 aiwencai/query，参考后端 `packages/server/src/pay-back/core/fetchUtil.ts` 的实际 get-robot-data/getDataList 地址与表单协议。签名继续调用服务器依赖中的 `pay-back-core.createV()`；仅运行固定签名程序，不开放任意 Node 代码/命令。无需额外 OpenAPI Key，但需要 Node 与已安装/构建的共享库；默认同级 `payback/packages/server`，异地部署用 `AGENT_IWENCAI_SERVER_DIR`。管理员 JSON 若已定义 aiwencai，仍优先使用管理员来源，不会被内置适配覆盖。
+
+示例任务参数为 `{"kind":"request","arguments":{"source":"aiwencai","operation":"query","parameters":{"question":"A股，最新价低于2024年9月24日收盘价，股票代码，股票简称","per_page":20,"max_pages":1}}}`。自然语言解析须核对，示例不代表复权/时点条件已经验证。默认首屏，最多20页/每页100，聚合名单上限512 KiB；reported_total 为上游报告数，returned_count 为实际名单数，complete 仅代表数量覆盖，不证明跨页快照一致。缺筛选条件、重复代码、首屏业务错误都明确拒绝，不把股东行数或错误当股票数量。
+
+真实首屏查询已验证；现有分页接口实测顶层成功但内部返回 -1201，适配会保留有效首屏和上游总数，标记 `complete=false / stop_reason=upstream_paging_error`，不宣称全量名单。分页使用独立限速（请求间隔1.2秒）且无自动重试，仍可能与后端爬虫争用同一IP；取消后不发起后续页。具体接入与限制见主仓库知识库 `docs/04-技术方案/Agent爱问财接入.md`。
+
+研究任务在独立 daemon 线程和有界队列运行，不阻塞现有 MCP worker；最多四个活动任务，物理排队项也有界。AgentService 持有研究 runtime，MCP 重连不会取消研究任务。进程重启后可读取仍在留存期内的成功证据，queued/running 标记 interrupted，不自动重发；`research_resume` 为失败/取消/中断任务创建新 ID，并在执行时重查来源策略，可能再次计费。CLI 上下文退出会取消其活动任务，后续可显式恢复。
+
+证据目录以 OS 文件锁限制一个写实例。request.json **明文保存查询参数、URL和 Python 代码**供恢复，不含宿主注入的供应商凭据；结果保存脱敏文本、UTC 完成时间、来源、输入摘要、文本摘要与完整产物摘要。分段读取每次最多 6000 字符，保留上限 64 份，在启动/新提交时清理超过 24 小时的产物；活动 Python 的输入临时保留，不能被清理抢先删除。取消丢弃在途响应，不能撤回已发请求；关闭最多等待 worker 一秒，仍在执行时目录锁保留到 worker 结束，避免旧线程和新实例双写。密钥原文回显会替换，但这不是对上游编码变形泄漏的完整防护；仅登记可信数据源。
+
+Python 用 `research_start(kind="python", arguments={"code":"...", "inputs":{"prices":"成功任务ID"}})`；代码通过 `inputs["prices"]` 读取完整证据文本，赋值给 `result`，不额外 print。最多四份输入，每份先验证证据摘要；不允许任意宿主路径。容器无网络、非 root、根目录只读、无宿主挂载与凭据，限制 128 MiB 内存、1 CPU、32 个进程、16 MiB 临时盘、32 KiB 代码、1 MiB 输入、256 KiB 输出及 20 秒执行时间。引擎须 rootless/cgroup v2/seccomp，可信 bootstrap 在运行代码前再次检查实际身份、Seccomp/NoNewPrivs/CapEff 和资源控制；任何条件不满足就失败，不降级。
+
+管理员预先准备兼容 `/usr/local/bin/python` 与标准库的镜像，再填写不可变 ID 或 `仓库@sha256:摘要`；运行时 `--pull=never`，模型不能选镜像或安装依赖。Windows 需先启动 Podman machine。可用 `podman image inspect docker.io/library/python:3.12-slim --format '{{.Id}}'` 查看已下载镜像的 ID，并通过 `uv run --frozen python scripts/smoke_research_sandbox.py --image sha256:<ID>` 运行独立环境冒烟。沙箱镜像未配置/格式错误只禁用 Python，公开取数不受影响。
+
+`research_export_tool(task_id, name)` 将成功 Python 的代码、输入别名、镜像及证据摘要导出为 task 目录中的 `tool-draft.json`，状态为 review_required；草案受同一留存策略约束，应在过期前进入正常代码评审流程。不会注册或覆盖正式工具，也不自动发布。代码运行成功不等于源数据真实或统计口径已验证。
+
+代码错误仅回传容器内有界类型、行号和消息，供修正后提交新任务；不回显引擎原始错误。宿主统一保持 domain_verified=false，脚本不能自行声明已验证业务口径。爱问财接入后回归338通过、5跳过；真实容器与爱问财首屏均已验证，分页限制见上文，未验收 Brave 真实密钥/额度。
+
+研究数据和请求可能含用户信息，`data/research/` 已忽略，不应提交仓库。共享文件系统需由部署账户设置目录 ACL；本服务没有多用户身份/产物授权，随机任务 ID 不等于访问控制。公网/多人开放、任意宿主执行、未经口径校验的精确统计及自动晋升正式工具不在范围内。续批实现与验收见同级主仓库 `payback/docs/04-技术方案/Agent隔离计算与任务恢复.md`。
+
 聊天支持通用问答：概念、计算、编程和写作不要求行情工具证据；复盘只按问题需要查询。工具失败、缺少个股证据或数据时效未知时，服务端保留模型回答并追加数据提示，不再整段替换成“证据不足”。模型仍须区分已核实行情、用户提供数据和假设，不得编造实时行情；只读工具权限不变。修改 `loop.py` 后需重启 Agent。
 
 “每日 AI 全景复盘”使用 `get_daily_panorama` 读取同一交易日的市场、板块、梯队和跌停名单，并在生成时读取腾讯外围行情；外围是生成时最新报价，可能延迟或属于其他交易日。Agent 服务在工作日 16:10 后每 15 分钟检查一次，当日数据完整且未归档时生成复盘；市场和短线记录的时间必须为当日 15:00 或之后，非交易日、午盘数据或数据缺失不会被当作收盘数据。服务需持续运行，生成失败会在当日下次检查时重试；生成结果保存在 `data/daily_reports/`。新生成的 AI 正文要求不超过 320 字，按结论、市场概览、板块与梯队、风险观察四行输出，只保留关键证据；旧归档不自动改写。若记录时间未随更新而刷新，或历史补录时间不是交易当日，需先核实数据，不能自动生成。

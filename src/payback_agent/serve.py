@@ -41,6 +41,7 @@ from .llm import LlmError
 from .loop import append_turn, ask_events
 from .prompt import load_system_prompt
 from .tools_source import open_stdio_source
+from .research_runtime import create_research_runtime
 from .daily_report import REPORT_DIR, build_report, read_report, write_report
 from .daily_report import _date
 from .review_charts import build_review_charts
@@ -74,6 +75,7 @@ class AgentService:
         self._sessions: OrderedDict[str, list[dict]] = OrderedDict()
         self._client: Any = None
         self._source: Any = None
+        self._research: Any = None
         self._stack: AsyncExitStack | None = None
         self._max_turns = max_turns or 8
         self._jobs_send: Any = None
@@ -141,7 +143,12 @@ class AgentService:
                         print(f"[serve] job failed: {type(exc).__name__}: {exc}",
                               file=sys.stderr)
         finally:
-            await self._dispose()
+            try:
+                await self._dispose()
+            finally:
+                if self._research is not None:
+                    await anyio.to_thread.run_sync(self._research.close)
+                    self._research = None
 
     async def _ensure_ready(self, *, needs_default: bool = True) -> None:
         if needs_default and self._client is None:
@@ -152,7 +159,11 @@ class AgentService:
         launch = config.mcp_launch_args()
         stack = AsyncExitStack()
         try:
-            self._source = await stack.enter_async_context(open_stdio_source(launch))
+            if self._research is None:
+                self._research = create_research_runtime()
+            context = (open_stdio_source(launch, research=self._research) if self._research is not None
+                       else open_stdio_source(launch))
+            self._source = await stack.enter_async_context(context)
         except BaseException:
             await stack.aclose()
             if self._client is not None and hasattr(self._client, "aclose"):
@@ -164,9 +175,11 @@ class AgentService:
     async def _dispose(self) -> None:
         """Tear down client + source inside the worker task that created them."""
         client, self._client = self._client, None
-        if client is not None and hasattr(client, "aclose"):
-            await client.aclose()
-        await self._discard_source()
+        try:
+            if client is not None and hasattr(client, "aclose"):
+                await client.aclose()
+        finally:
+            await self._discard_source()
 
     async def _discard_source(self) -> None:
         stack, self._stack, self._source = self._stack, None, None

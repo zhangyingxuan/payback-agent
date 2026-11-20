@@ -1,0 +1,23 @@
+{
+  "brave_web": {
+    "label": "Brave 公开网页搜索（配置示例）",
+    "domain": "general",
+    "origin": "https://api.search.brave.com",
+    "documentation": "https://api-dashboard.search.brave.com/api-reference/web/search/get",
+    "auth": {
+      "env": "AGENT_RESEARCH_BRAVE_API_KEY",
+      "header": "X-Subscription-Token"
+    },
+    "operations": {
+      "search": {
+        "path": "/res/v1/web/search",
+        "method": "GET",
+        "read_only": true,
+        "parameters": {
+          "q": {"type": "string", "required": true, "max_length": 500},
+          "count": {"type": "integer", "minimum": 1, "maximum": 5}
+        }
+      }
+    }
+  }
+}

@@ -64,3 +64,11 @@ def test_persona_focuses_on_low_position_and_theme_research():
     for item in ('资深的顶级短线游资', '低位挖掘', '题材挖掘', '催化', '低位不等于股价便宜',
                  '确认条件', '失效条件', '不宣称已经扫描全市场', '内幕渠道'):
         assert item in text
+
+
+def test_research_fallback_keeps_authority_and_evidence_boundaries():
+    text = prompt.load_system_prompt()
+    for item in ('research_sources', 'research_start', 'research_status', 'research_result',
+                 'aiwencai', 'wait_seconds=20', '超过等待时间', '统计口径', '搜索词', '不在宿主执行生成代码',
+                 'research_resume', 'research_export_tool'):
+        assert item in text

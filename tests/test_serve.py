@@ -147,6 +147,66 @@ def test_disconnected_queued_request_does_not_start_agent(monkeypatch):
     assert started == []
 
 
+def test_agent_service_keeps_research_runtime_across_source_disposal(monkeypatch, tmp_path):
+    from contextlib import asynccontextmanager
+    from payback_agent.research_runtime import ResearchRuntime
+    from payback_agent.research import ResearchBackend
+    from payback_agent.research_jobs import ResearchJobs
+    from payback_agent import serve
+
+    jobs = ResearchJobs(tmp_path, lambda *args: {'text': 'data'})
+    runtime = ResearchRuntime(ResearchBackend(), jobs)
+    borrowed = []
+
+    @asynccontextmanager
+    async def source(argv, **kwargs):
+        borrowed.append(kwargs.get('research'))
+        yield object()
+
+    monkeypatch.setattr(serve, 'open_stdio_source', source)
+    monkeypatch.setattr(serve, 'create_research_runtime', lambda: runtime)
+    service = AgentService()
+
+    async def go():
+        await service._ensure_ready(needs_default=False)
+        await service._dispose()
+        await service._ensure_ready(needs_default=False)
+        assert borrowed == [runtime, runtime]
+        assert jobs.start('fetch', {})['task_id']
+        await service._dispose()
+
+    try:
+        anyio.run(go)
+    finally:
+        runtime.close()
+
+
+def test_dispose_still_closes_source_if_llm_close_fails():
+    import pytest
+
+    class Client:
+        async def aclose(self):
+            raise RuntimeError('fake client close failure')
+
+    class Stack:
+        closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    service = AgentService()
+    service._client = Client()
+    service._stack = stack = Stack()
+    service._source = object()
+
+    async def go():
+        with pytest.raises(RuntimeError):
+            await service._dispose()
+        assert stack.closed and service._source is None
+
+    anyio.run(go)
+
+
 def test_chat_streams_session_then_the_loop_events():
     app, _, _ = _app(_answer("涨停 42 家"))
     with TestClient(app) as client:

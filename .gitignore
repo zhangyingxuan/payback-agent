@@ -8,6 +8,8 @@ __pycache__/
 .superpowers/
 traces/
 data/daily_reports/
+data/research/
+research-sources.local.json
 *.trace.jsonl
 
 data/memory.sqlite3*
