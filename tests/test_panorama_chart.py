@@ -6,6 +6,7 @@ from xml.etree import ElementTree
 
 from payback_agent.panorama import panorama_markdown
 from test_loop import FakeLlm, FakeSource, _call, _events
+from test_serve import authorize_test_owner
 
 
 def _snapshot():

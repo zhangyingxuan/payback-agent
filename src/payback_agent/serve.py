@@ -22,6 +22,7 @@ whatever comes back. Two reasons:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -30,6 +31,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, AsyncIterator
 
 import anyio
+import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
@@ -321,6 +323,48 @@ def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
 
 
+async def _authorize_owner(request: Request) -> JSONResponse | None:
+    # 复用 NestJS 的 JWT 校验和账号查询，Agent 无需持有签名密钥。
+    authorization = request.headers.get('authorization', '')
+    scheme, _, token = authorization.partition(' ')
+    if scheme.lower() != 'bearer' or not token or any(char.isspace() for char in token):
+        return JSONResponse({'error': '请先登录'}, status_code=401,
+                            headers={'WWW-Authenticate': 'Bearer'})
+    owner = os.environ.get('AGENT_OWNER_ACCOUNT', '').strip()
+    if not owner:
+        return JSONResponse({'error': 'Agent 尚未配置会话所有者'}, status_code=503)
+    url = os.environ.get('AGENT_AUTH_PROFILE_URL', 'http://127.0.0.1:3000/blowsysun/auth/profile')
+    try:
+        # 登录凭据仅发往部署配置的身份服务，禁止重定向及环境代理。
+        with anyio.fail_after(5):
+            async with httpx.AsyncClient(timeout=5, follow_redirects=False, trust_env=False) as client:
+                profile = await client.get(url, headers={'Authorization': authorization})
+        if profile.status_code in (401, 403):
+            return JSONResponse({'error': '登录已失效，请重新登录'}, status_code=401,
+                                headers={'WWW-Authenticate': 'Bearer'})
+        profile.raise_for_status()
+        data = profile.json()
+        account = data.get('account') if isinstance(data, dict) else None
+        if not isinstance(account, str) or not account:
+            raise ValueError('missing account')
+    except (httpx.HTTPError, httpx.InvalidURL, TimeoutError, ValueError):
+        return JSONResponse({'error': '暂时无法校验登录身份'}, status_code=503)
+    if account != owner:
+        return JSONResponse({'error': '当前账号无权访问 Agent 会话'}, status_code=403)
+    return None
+
+
+def _owner_only(endpoint):
+    async def authorized(request: Request):
+        # 在解析正文、访问存储或提交任务前完成授权，所有历史记录只对同一个所有者开放。
+        denial = await _authorize_owner(request)
+        response = denial if denial is not None else await endpoint(request)
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+
+    return authorized
+
+
 def create_app(*, agent: AgentService | None = None,
                max_turns: int | None = None) -> Starlette:
     service = agent or AgentService(max_turns=max_turns)
@@ -464,15 +508,15 @@ def create_app(*, agent: AgentService | None = None,
         return Response(status_code=204)
 
     return Starlette(
-        routes=[Route("/sessions", list_sessions),
-                Route("/memories", memories, methods=["GET", "POST"]),
-                Route("/memories/{memory_id}", delete_memory, methods=["PUT", "DELETE"]),
+        routes=[Route("/sessions", _owner_only(list_sessions)),
+                Route("/memories", _owner_only(memories), methods=["GET", "POST"]),
+                Route("/memories/{memory_id}", _owner_only(delete_memory), methods=["PUT", "DELETE"]),
                 Route("/healthz", healthz),
                 Route('/daily-reports/{trade_date}', daily_report, methods=['GET', 'POST']),
                 Route('/review-charts/{trade_date}', review_charts, methods=['POST']),
-                Route("/chat", chat, methods=["POST"]),
-                Route("/sessions/{session_id}", session_detail, methods=["GET"]),
-                Route("/sessions/{session_id}", delete_session, methods=["DELETE"])],
+                Route("/chat", _owner_only(chat), methods=["POST"]),
+                Route("/sessions/{session_id}", _owner_only(session_detail), methods=["GET"]),
+                Route("/sessions/{session_id}", _owner_only(delete_session), methods=["DELETE"])],
         lifespan=lambda app: _lifespan(service),
     )
 

@@ -8,12 +8,22 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import anyio
+import pytest
 from types import SimpleNamespace
 
 from starlette.testclient import TestClient
 
 from payback_agent.llm import ChatResult, LlmError
 from payback_agent.serve import AgentService, create_app
+
+
+@pytest.fixture(autouse=True)
+def authorize_test_owner(monkeypatch):
+    async def authorize(_request):
+        return None
+
+    # HTTP 鉴权边界由 test_chat_auth 独立覆盖。
+    monkeypatch.setattr('payback_agent.serve._authorize_owner', authorize)
 
 
 def _tool(name):

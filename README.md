@@ -141,7 +141,9 @@ Python 用 `research_start(kind="python", arguments={"code":"...", "inputs":{"pr
 
 无 `view=summary` 的旧 `GET /sessions` 保持返回最近 50 条完整会话，兼容已有调用。摘要分页是一次聚合查询；正文搜索当前按字面扫描文本，历史量很大时需要评估全文索引。长期偏好可通过 /memories 的 GET、POST、PUT、DELETE 管理。
 
-以下端点无鉴权，默认只听 127.0.0.1：
+Agent 默认只听 `127.0.0.1`。Chat、会话和长期偏好接口要求 NestJS 登录的 Bearer token。配置 `AGENT_OWNER_ACCOUNT` 为现有数据的所有者账号。Agent 默认调用 `http://127.0.0.1:3000/blowsysun/auth/profile` 校验登录，分主机部署时用 `AGENT_AUTH_PROFILE_URL` 指向可信的 NestJS 身份服务。匿名或登录失效返回 401，其他账号返回 403，所有者未配置或身份服务异常返回 503。现有 MySQL 数据由指定所有者独占，更换所有者等同于移交历史数据。
+
+健康检查、每日复盘和双图接口依赖可信本机或受保护内网的访问边界。
 
 Codex 后端显式请求 `model_reasoning_summary="detailed"`，通过 `reasoning_delta` 转发模型实际返回的摘要。模型可能不提供摘要；聊天页生成期间展示等待状态，结束后提示“模型未提供思考摘要”，不会把等待提示当作模型思考内容。修改后需重启 Agent 服务。
 

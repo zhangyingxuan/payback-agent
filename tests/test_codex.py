@@ -155,6 +155,11 @@ def test_codex_output_must_be_valid_json(monkeypatch):
 
 
 def test_web_chat_uses_codex_tool_results(monkeypatch):
+    async def authorize(_request):
+        return None
+
+    # 此用例专门验证 Codex 工具结果能进入 Web 对话。
+    monkeypatch.setattr('payback_agent.serve._authorize_owner', authorize)
     from starlette.testclient import TestClient
     from payback_agent.serve import AgentService, create_app
     from test_serve import FakeSource, _events

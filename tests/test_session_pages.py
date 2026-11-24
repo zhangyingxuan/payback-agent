@@ -2,7 +2,7 @@
 
 import pytest
 from starlette.testclient import TestClient
-from test_serve import _app
+from test_serve import _app, authorize_test_owner
 
 
 def test_summary_pagination_search_and_detail():
