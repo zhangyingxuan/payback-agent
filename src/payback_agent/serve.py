@@ -21,6 +21,9 @@ whatever comes back. Two reasons:
 
 from __future__ import annotations
 
+import base64
+import binascii
+
 import json
 import os
 import sys
@@ -241,7 +244,8 @@ class AgentService:
         message, session_id, events_send = job[:3]
         # 使用服务端时间保存本轮开始和回复完成时刻，刷新后仍可展示同一时间。
         asked_at = int(datetime.now(timezone.utc).timestamp() * 1000)
-        model = job[4] if len(job) == 5 else None
+        model = job[4] if len(job) >= 5 else None
+        image = job[5] if len(job) == 6 else None
         selected_client = None
         async with events_send:
             try:
@@ -260,7 +264,7 @@ class AgentService:
                 async for event in ask_events(
                         message, llm=selected_client or self._client, source=self._source,
                         system_prompt=system_prompt,
-                        max_turns=self._max_turns, history=history):
+                        max_turns=self._max_turns, history=history, image=image):
                     if event["type"] == "done":
                         done = event
                         # 先提交完整问答，再通知客户端完成，避免成功状态与存储不一致。
@@ -270,7 +274,7 @@ class AgentService:
                                 if self._sessions.get(session_id) is not history:
                                     raise LlmError('会话已删除，本次回答未保存')
                                 answered_at = int(datetime.now(timezone.utc).timestamp() * 1000)
-                                await anyio.to_thread.run_sync(self.memory.save_turn, session_id, message, done["content"], asked_at, answered_at)
+                                await anyio.to_thread.run_sync(self.memory.save_turn, session_id, message, done["content"], asked_at, answered_at, image)
                                 done['questionCreatedAt'] = asked_at
                                 done['createdAt'] = answered_at
                                 self._sessions[session_id] = append_turn(history, message, done["content"])
@@ -409,6 +413,18 @@ def create_app(*, agent: AgentService | None = None,
         if not isinstance(message, str) or not message.strip():
             return JSONResponse({"error": "message must be a non-empty string"},
                                 status_code=400)
+        image = body.get('image')
+        if image is not None:
+            # 只接收客户端编码的 JPEG，避免模型或 CLI 读取外部地址与本地路径。
+            prefix = 'data:image/jpeg;base64,'
+            if not isinstance(image, str) or len(image) > 512 * 1024 or not image.startswith(prefix):
+                return JSONResponse({'error': '图片格式无效或超过大小限制'}, status_code=400)
+            try:
+                jpeg = base64.b64decode(image[len(prefix):], validate=True)
+                if not jpeg.startswith(b'\xff\xd8\xff') or not jpeg.endswith(b'\xff\xd9'):
+                    raise ValueError('invalid JPEG markers')
+            except (ValueError, binascii.Error):
+                return JSONResponse({'error': '图片格式无效'}, status_code=400)
         session_id = body.get("session_id")
         if session_id is not None and (not isinstance(session_id, str)
                                        or not session_id.strip() or len(session_id) > 128):
@@ -427,7 +443,7 @@ def create_app(*, agent: AgentService | None = None,
             # 请求断开时关闭接收端，由工作协程在下次发送时结束当前任务。
             async with receive_stream:
                 try:
-                    await service.submit((message.strip(), session_id, send_stream, 'chat', model))
+                    await service.submit((message.strip(), session_id, send_stream, 'chat', model, image))
                 except (anyio.ClosedResourceError, anyio.BrokenResourceError,
                         AttributeError):
                     await send_stream.aclose()

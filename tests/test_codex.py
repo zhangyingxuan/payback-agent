@@ -1,5 +1,6 @@
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import anyio
@@ -83,6 +84,27 @@ def test_codex_response_can_request_a_database_tool(monkeypatch):
     _mock_process(monkeypatch, run)
     result = anyio.run(CodexClient().chat, [{'role': 'user', 'content': '昨天涨停多少'}], [{'function': {'name': 'get_limit_up_structure'}}])
     assert result.message['tool_calls'][0]['function'] == {'name': 'get_limit_up_structure', 'arguments': '{"date": "yesterday"}'}
+
+
+def test_codex_passes_images_as_files_and_cleans_up(monkeypatch):
+    uploaded = []
+
+    async def run(command, **kwargs):
+        image_path = Path(command[command.index('--image') + 1])
+        uploaded.append(image_path)
+        assert image_path.read_bytes() == bytes.fromhex('ffd8ffffd9')
+        assert json.loads(kwargs['input'])['messages'][-1]['content'] == '看图'
+        event = {'type': 'item.completed', 'item': {'type': 'agent_message',
+                 'text': json.dumps({'content': 'ok', 'tool_calls': []})}}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(event).encode())
+
+    _mock_process(monkeypatch, run)
+    message = {'role': 'user', 'content': [
+        {'type': 'text', 'text': '看图'},
+        {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,/9j//9k='}},
+    ]}
+    assert anyio.run(CodexClient().chat, [message]).message['content'] == 'ok'
+    assert uploaded and not uploaded[0].parent.exists()
 
 
 def test_codex_failure_is_reported_without_exposing_stderr(monkeypatch):

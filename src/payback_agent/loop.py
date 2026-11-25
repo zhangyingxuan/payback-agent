@@ -118,6 +118,7 @@ async def ask_events(
     max_turns: int = 8,
     trace: Any = None,
     history: list[dict] | None = None,
+    image: str | None = None,
 ) -> AsyncIterator[dict]:
     """Run the tool-calling loop as an event stream -- the kernel everything else wraps.
 
@@ -154,7 +155,12 @@ async def ask_events(
             text = re.sub(r'!\[(复盘全景图|涨停梯队图)\]\(data:image/svg\+xml;base64,[A-Za-z0-9+/=]+\)',
                           r'[\1已展示]', turn["content"]) if turn["role"] == "assistant" else turn["content"]
             messages.append({**turn, "content": text})
-    messages.append({"role": "user", "content": question})
+    # 图片仅进入当前工具调用循环，历史仍由调用方保存为可见文本。
+    content_input = question if image is None else [
+        {"type": "text", "text": question},
+        {"type": "image_url", "image_url": {"url": image}},
+    ]
+    messages.append({"role": "user", "content": content_input})
     tools = openai_tools(await source.list_tools())
     if trace is not None:
         await trace.write({"type": "tools", "names": [t["function"]["name"] for t in tools]})

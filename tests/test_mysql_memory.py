@@ -23,11 +23,16 @@ def test_message_timestamps_persist_and_legacy_remains_unknown():
     store.save_turn('session', '问题', '答案', 1794826801000, 1794826805000)
     assert cursor.execute.call_args_list[0].args[1] == ('session', '问题', '答案')
     assert cursor.execute.call_args.args[1] == (12, 1794826801000, 1794826805000)
-    cursor.fetchall.return_value = [('问题', '答案', 1794826801000, 1794826805000),
-                                   ('旧问题', '旧答案', None, None)]
+    image = 'data:image/jpeg;base64,/9j//9k='
+    store.save_turn('session', '图片问题', '图片答案', image=image)
+    assert cursor.execute.call_args.args[1] == (12, image)
+    cursor.fetchall.return_value = [('问题', '答案', 1794826801000, 1794826805000, image),
+                                   ('旧问题', '旧答案', None, None, None)]
     messages = store.session_detail('session')['messages']
     assert [message['createdAt'] for message in messages] == [
         1794826801000, 1794826805000, None, None]
+    assert messages[0]['image'] == image
+    assert all('image' not in message for message in messages[1:])
 
 
 def test_memory_database_requires_dedicated_credentials(monkeypatch):

@@ -43,6 +43,11 @@ class MemoryStore:
                         id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL UNIQUE,
                         content TEXT NOT NULL
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4''')
+                    # 独立附件表兼容旧数据库和仅有建表权限的账号。
+                    cursor.execute('''CREATE TABLE IF NOT EXISTS agent_conversation_turn_image (
+                        turn_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                        image MEDIUMTEXT CHARACTER SET ascii NOT NULL
+                    ) ENGINE=InnoDB''')
                     cursor.execute('''CREATE TABLE IF NOT EXISTS agent_memory_import (
                         source_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4''')
@@ -80,14 +85,19 @@ class MemoryStore:
             return result
 
     def save_turn(self, session_id: str, question: str, answer: str,
-                  question_created_at: int | None = None, answer_created_at: int | None = None) -> None:
+                  question_created_at: int | None = None, answer_created_at: int | None = None,
+                  image: str | None = None) -> None:
         with self.connection() as conn, conn.cursor() as cursor:
             cursor.execute('INSERT INTO agent_conversation_turn(session_id, question, answer) '
                            'VALUES (%s, %s, %s)', (session_id, question, answer))
-            # 与正文处于同一事务，避免回答保存成功却丢失时间。
+            # 时间和图片与正文一并提交，避免历史只保存部分消息。
+            turn_id = cursor.lastrowid
             cursor.execute('INSERT INTO agent_conversation_turn_time '
                            '(turn_id, question_created_at, answer_created_at) VALUES (%s, %s, %s)',
-                           (cursor.lastrowid, question_created_at, answer_created_at))
+                           (turn_id, question_created_at, answer_created_at))
+            if image is not None:
+                cursor.execute('INSERT INTO agent_conversation_turn_image (turn_id, image) VALUES (%s, %s)',
+                               (turn_id, image))
 
     def session_page(self, limit: int, cursor: int | None, query: str) -> dict:
         # 摘要通过一次聚合查询获取；游标用消息 ID，不加载正文也不依赖缺失的时间列。
@@ -120,19 +130,23 @@ class MemoryStore:
 
     def session_detail(self, session_id: str) -> dict | None:
         with self.connection() as conn, conn.cursor() as cursor:
-            cursor.execute('SELECT t.question, t.answer, stamp.question_created_at, stamp.answer_created_at '
+            cursor.execute('SELECT t.question, t.answer, stamp.question_created_at, stamp.answer_created_at, attachment.image '
                            'FROM agent_conversation_turn t LEFT JOIN agent_conversation_turn_time stamp ON stamp.turn_id = t.id '
+                           'LEFT JOIN agent_conversation_turn_image attachment ON attachment.turn_id = t.id '
                            'WHERE t.session_id = %s ORDER BY t.id', (session_id,))
             rows = cursor.fetchall()
         if not rows:
             return None
-        return {'id': session_id, 'messages': [item for question, answer, asked_at, answered_at in rows for item in (
-            {'role': 'user', 'content': question, 'createdAt': asked_at},
+        return {'id': session_id, 'messages': [item for question, answer, asked_at, answered_at, image in rows for item in (
+            {'role': 'user', 'content': question, 'createdAt': asked_at, **({'image': image} if image else {})},
             {'role': 'assistant', 'content': answer, 'createdAt': answered_at})]}
 
     def delete_session(self, session_id: str) -> bool:
         with self.connection() as conn, conn.cursor() as cursor:
-            # 删除正文前清理对应时间，避免删除会话后留下孤立元数据。
+            # 删除正文前同步清理附件和时间，避免留下孤立数据。
+            cursor.execute('DELETE attachment FROM agent_conversation_turn_image attachment '
+                           'JOIN agent_conversation_turn t ON t.id = attachment.turn_id WHERE t.session_id = %s',
+                           (session_id,))
             cursor.execute('DELETE stamp FROM agent_conversation_turn_time stamp '
                            'JOIN agent_conversation_turn t ON t.id = stamp.turn_id WHERE t.session_id = %s',
                            (session_id,))

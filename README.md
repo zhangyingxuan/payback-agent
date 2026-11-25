@@ -139,6 +139,8 @@ Python 用 `research_start(kind="python", arguments={"code":"...", "inputs":{"pr
 
 若记忆库账号按表授权，需为 `agent_conversation_turn_time` 单独授予 SELECT、INSERT、DELETE；不需要 UPDATE 或扩大到全库权限。
 
+已完成的图片消息将 JPEG 预览与问答一起保存。会话详情的用户消息通过可选 `image` 字段返回预览。按表授权时，需要为 `agent_conversation_turn_image` 授予 SELECT、INSERT、DELETE。升级前已发送且未保存图像的记录仍只显示附件名称。
+
 无 `view=summary` 的旧 `GET /sessions` 保持返回最近 50 条完整会话，兼容已有调用。摘要分页是一次聚合查询；正文搜索当前按字面扫描文本，历史量很大时需要评估全文索引。长期偏好可通过 /memories 的 GET、POST、PUT、DELETE 管理。
 
 Agent 默认只听 `127.0.0.1`。Chat、会话和长期偏好接口要求 NestJS 登录的 Bearer token。配置 `AGENT_OWNER_ACCOUNT` 为现有数据的所有者账号。Agent 默认调用 `http://127.0.0.1:3000/blowsysun/auth/profile` 校验登录，分主机部署时用 `AGENT_AUTH_PROFILE_URL` 指向可信的 NestJS 身份服务。匿名或登录失效返回 401，其他账号返回 403，所有者未配置或身份服务异常返回 503。现有 MySQL 数据由指定所有者独占，更换所有者等同于移交历史数据。
@@ -150,12 +152,14 @@ Codex 后端显式请求 `model_reasoning_summary="detailed"`，通过 `reasonin
 | 端点 | 行为 |
 |---|---|
 | `GET /healthz` | `{"status":"ok","sessions":N}` |
-| `POST /chat` `{message, session_id?}` | SSE 流；不带 `session_id` 则新建并在首个事件里返回 |
+| `POST /chat` `{message, session_id?, model?, image?}` | SSE 流；不带 `session_id` 则新建并在首个事件里返回 |
 | `DELETE /sessions/{id}` | 丢弃一个会话的服务端历史 |
 | `GET /daily-reports/latest` | 读取最新一份每日复盘 |
 | `GET /daily-reports/{date}` | 读取指定交易日的复盘 |
 | `POST /daily-reports/{date}` | 生成或重新生成指定交易日的复盘 |
 | `POST /review-charts/{date}` | 校验同日收盘数据，返回全景图与完整梯队图 SVG base64，供定时推送使用；无模型调用 |
+
+Chat 的 `image` 是可选 JPEG 数据 URL（最多 512 KiB）。网页会将视频的三个时间点合成一张静态图。Gateway 需要支持 `image_url` 的视觉模型，Codex CLI 通过 `--image` 接收图像。
 
 收盘双图由 payback server 在交易日北京时间 15:38 触发，push-server 转成 PNG 后推送飞书和企微。此接口复用串行 MCP worker，避免与聊天并发争用标准输入输出；必需的大盘、短线、资金和梯队记录须为指定日 15:00 后的数据，否则返回 503。梯队的周期、封板率和涨跌停数使用本次短线原始快照；晋级率若没有同日收盘后的派生表记录则显示“未提供”。日期格式错误返回 400。返回结构为 `{data_as_of, charts: [{name: "panorama", svg_base64}, {name: "ladder", svg_base64}]}`。部署需同时更新三个服务，server 配置 `PAYBACK_AGENT_URL`，push-server 配置飞书图片上传应用凭据及中文字体。接口只允许可信本机或受保护内网调用，不要直接暴露公网。
 

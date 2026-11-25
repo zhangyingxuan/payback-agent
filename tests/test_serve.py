@@ -83,6 +83,25 @@ def _answer(text):
     return {"role": "assistant", "content": text}
 
 
+def test_chat_saves_image_for_session_detail_without_replaying_it_to_model():
+    app, llm, _ = _app(_answer('收到画面'), _answer('继续'))
+    image = 'data:image/jpeg;base64,/9j//9k='
+    with TestClient(app) as client:
+        assert client.post('/chat', json={'message': '看看', 'image': 'https://example.com/a.jpg'}).status_code == 400
+        events = _events(client.post('/chat', json={'message': '看看', 'image': image}))
+        assert events[-1]['type'] == 'done'
+        assert llm.requests[0][-1]['content'] == [
+            {'type': 'text', 'text': '看看'},
+            {'type': 'image_url', 'image_url': {'url': image}},
+        ]
+        session_id = events[0]['session_id']
+        message = client.get('/sessions/' + session_id).json()['messages'][0]
+        assert message['content'] == '看看'
+        assert message['image'] == image
+        _events(client.post('/chat', json={'message': '继续', 'session_id': session_id}))
+        assert llm.requests[1][1]['content'] == '看看'
+
+
 def test_chat_timestamps_match_reloaded_messages():
     app, _, _ = _app(_answer('你好'))
     with TestClient(app) as client:

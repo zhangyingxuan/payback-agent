@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -65,10 +66,32 @@ class CodexClient:
         model = os.environ.get("AGENT_CODEX_MODEL")
         if model:
             command.extend(["--model", model])
-        command.append("-")
+        image_dir = None
         try:
+            # Codex CLI 通过本地图片参数接收视觉输入，避免把 Base64 当作普通模型文本。
+            prompt_messages = []
+            for message in messages:
+                content = message.get('content')
+                if message.get('role') != 'user' or not isinstance(content, list):
+                    prompt_messages.append(message)
+                    continue
+                parts = []
+                for part in content:
+                    if part['type'] == 'text':
+                        parts.append(part['text'])
+                    elif part['type'] == 'image_url':
+                        if image_dir is None:
+                            image_dir = tempfile.TemporaryDirectory(prefix='payback-chat-')
+                        image_path = Path(image_dir.name) / f'image-{len(command)}.jpg'
+                        image_path.write_bytes(base64.b64decode(part['image_url']['url'].split(',', 1)[1]))
+                        command.extend(['--image', str(image_path)])
+                prompt_messages.append({**message, 'content': '\n'.join(parts)})
+            # --image 接收多个路径，用分隔符保留标准输入参数。
+            if image_dir is not None:
+                command.append('--')
+            command.append('-')
             # JSON 输入前的说明也放进 JSON，便于保持 stdin 单一格式。
-            data = json.dumps({"instruction": prompt, "messages": messages, "tools": tools or []},
+            data = json.dumps({"instruction": prompt, "messages": prompt_messages, "tools": tools or []},
                               ensure_ascii=False).encode("utf-8")
             with anyio.fail_after(180):
                 async with await anyio.open_process(command, stderr=subprocess.DEVNULL) as process:
@@ -117,6 +140,8 @@ class CodexClient:
             raise LlmError("Codex CLI 返回了无法解析的结果") from exc
         finally:
             os.unlink(schema_path)
+            if image_dir is not None:
+                image_dir.cleanup()
 
     async def chat(self, messages: list[dict], tools: list[dict] | None = None) -> ChatResult:
         async for kind, payload in self.chat_stream(messages, tools):
