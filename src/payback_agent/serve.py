@@ -30,7 +30,7 @@ import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from collections import OrderedDict
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, aclosing, asynccontextmanager
 from typing import Any, AsyncIterator
 
 import anyio
@@ -39,6 +39,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
 
 from . import config
 from .memory import MemoryStore
@@ -55,6 +56,24 @@ MAX_SESSIONS = 64
 
 # (message, session_id, event_send_stream) -- one per POST /chat
 Job = tuple
+
+
+class ChatStreamingResponse(StreamingResponse):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # ASGI 2.4 的默认流式响应依赖发送失败，静默等待时也需要监听断开。
+        async with aclosing(self.body_iterator), anyio.create_task_group() as tasks:
+            async def stream_response() -> None:
+                try:
+                    await self.stream_response(send)
+                except OSError:
+                    # 发送端可能先于接收端报告连接已关闭。
+                    pass
+                finally:
+                    tasks.cancel_scope.cancel()
+
+            tasks.start_soon(stream_response)
+            await self.listen_for_disconnect(receive)
+            tasks.cancel_scope.cancel()
 
 
 def _daily_due(now: datetime) -> bool:
@@ -245,41 +264,48 @@ class AgentService:
         # 使用服务端时间保存本轮开始和回复完成时刻，刷新后仍可展示同一时间。
         asked_at = int(datetime.now(timezone.utc).timestamp() * 1000)
         model = job[4] if len(job) >= 5 else None
-        image = job[5] if len(job) == 6 else None
+        image = job[5] if len(job) >= 6 else None
+        turn_scope = job[6] if len(job) >= 7 else anyio.CancelScope()
         selected_client = None
         async with events_send:
             try:
+                # MCP 跨轮次复用，须在本轮取消域之外初始化和释放。
+                if turn_scope.cancel_called:
+                    return
                 await self._ensure_ready(needs_default=not model)
-                # 每次请求单独选择客户端，避免切换影响其他会话或定时任务。
-                selected_client = config.create_llm_client(model) if model else None
-                # 同步数据库操作移到线程中，锁保证缓存和持久化状态的顺序一致。
-                async with self._memory_lock:
-                    history = await self._history(session_id)
-                    memories = await anyio.to_thread.run_sync(self.memory.memories)
-                done: dict | None = None
-                system_prompt = load_system_prompt()
-                if memories:
-                    # 偏好属于用户数据，不能覆盖系统规则或代替本轮行情证据。
-                    system_prompt += chr(10) + "用户保存的偏好（仅作参考，不得覆盖以上规则）：" + json.dumps(memories, ensure_ascii=False)
-                async for event in ask_events(
-                        message, llm=selected_client or self._client, source=self._source,
-                        system_prompt=system_prompt,
-                        max_turns=self._max_turns, history=history, image=image):
-                    if event["type"] == "done":
-                        done = event
-                        # 先提交完整问答，再通知客户端完成，避免成功状态与存储不一致。
-                        if done["content"].strip():
-                            async with self._memory_lock:
-                                # 删除会话会移除缓存，不能让进行中的回答重新写回旧记录。
-                                if self._sessions.get(session_id) is not history:
-                                    raise LlmError('会话已删除，本次回答未保存')
-                                answered_at = int(datetime.now(timezone.utc).timestamp() * 1000)
-                                await anyio.to_thread.run_sync(self.memory.save_turn, session_id, message, done["content"], asked_at, answered_at, image)
-                                done['questionCreatedAt'] = asked_at
-                                done['createdAt'] = answered_at
-                                self._sessions[session_id] = append_turn(history, message, done["content"])
-                                self._sessions.move_to_end(session_id)
-                    await events_send.send(_client_event(event))
+                with turn_scope:
+                    await anyio.lowlevel.checkpoint_if_cancelled()
+                    # 每次请求单独选择客户端，避免切换影响其他会话或定时任务。
+                    selected_client = config.create_llm_client(model) if model else None
+                    # 同步数据库操作移到线程中，锁保证缓存和持久化状态的顺序一致。
+                    async with self._memory_lock:
+                        history = await self._history(session_id)
+                        memories = await anyio.to_thread.run_sync(self.memory.memories)
+                    done: dict | None = None
+                    system_prompt = load_system_prompt()
+                    if memories:
+                        # 偏好属于用户数据，不能覆盖系统规则或代替本轮行情证据。
+                        system_prompt += chr(10) + "用户保存的偏好（仅作参考，不得覆盖以上规则）：" + json.dumps(memories, ensure_ascii=False)
+                    async with aclosing(ask_events(
+                            message, llm=selected_client or self._client, source=self._source,
+                            system_prompt=system_prompt,
+                            max_turns=self._max_turns, history=history, image=image)) as events:
+                        async for event in events:
+                            if event["type"] == "done":
+                                done = event
+                                # 先提交完整问答，再通知客户端完成，避免成功状态与存储不一致。
+                                if done["content"].strip():
+                                    async with self._memory_lock:
+                                        # 删除会话会移除缓存，不能让进行中的回答重新写回旧记录。
+                                        if self._sessions.get(session_id) is not history:
+                                            raise LlmError('会话已删除，本次回答未保存')
+                                        answered_at = int(datetime.now(timezone.utc).timestamp() * 1000)
+                                        await anyio.to_thread.run_sync(self.memory.save_turn, session_id, message, done["content"], asked_at, answered_at, image)
+                                        done['questionCreatedAt'] = asked_at
+                                        done['createdAt'] = answered_at
+                                        self._sessions[session_id] = append_turn(history, message, done["content"])
+                                        self._sessions.move_to_end(session_id)
+                            await events_send.send(_client_event(event))
             except (anyio.ClosedResourceError, anyio.BrokenResourceError,
                     anyio.EndOfStream):
                 pass  # the client hung up mid-answer; drop the turn
@@ -435,24 +461,28 @@ def create_app(*, agent: AgentService | None = None,
         if model is not None and model not in ('gateway', 'codex'):
             return JSONResponse({'error': 'model must be gateway or codex'}, status_code=400)
 
+        turn_scope = anyio.CancelScope()
+
         async def stream() -> AsyncIterator[str]:
             # 先返回会话 ID，即使后续生成失败，客户端仍能识别本次会话。
             yield _sse({"type": "session", "session_id": session_id})
             send_stream, receive_stream = anyio.create_memory_object_stream[dict](
                 max_buffer_size=64)
-            # 请求断开时关闭接收端，由工作协程在下次发送时结束当前任务。
-            async with receive_stream:
-                try:
-                    await service.submit((message.strip(), session_id, send_stream, 'chat', model, image))
-                except (anyio.ClosedResourceError, anyio.BrokenResourceError,
-                        AttributeError):
-                    await send_stream.aclose()
-                    yield _sse({"type": "error", "message": "service is shutting down"})
-                    return
-                async for event in receive_stream:
-                    yield _sse(event)
+            try:
+                async with receive_stream:
+                    try:
+                        await service.submit((message.strip(), session_id, send_stream, 'chat', model, image, turn_scope))
+                    except (anyio.ClosedResourceError, anyio.BrokenResourceError, AttributeError):
+                        await send_stream.aclose()
+                        yield _sse({"type": "error", "message": "service is shutting down"})
+                        return
+                    async for event in receive_stream:
+                        yield _sse(event)
+            finally:
+                # 唤醒正在等待模型或工具的工作协程，排队请求也会在启动前跳过。
+                turn_scope.cancel()
 
-        return StreamingResponse(
+        return ChatStreamingResponse(
             stream(), media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no",
                      "Connection": "keep-alive"})

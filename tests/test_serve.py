@@ -176,6 +176,69 @@ def test_disconnected_queued_request_does_not_start_agent(monkeypatch):
     assert started == []
 
 
+@pytest.mark.parametrize("waiting_for", ["model", "tool"])
+def test_chat_disconnect_cancels_inflight_work_and_releases_worker(waiting_for):
+    app, llm, service = _app({"role": "assistant", "content": "下一轮成功"})
+
+    async def run():
+        started, stopped = anyio.Event(), anyio.Event()
+        original_chat = llm.chat
+
+        # 两种等待都不发送新事件，确保取消由断开触发。
+        async def block():
+            started.set()
+            try:
+                await anyio.sleep(3)
+            finally:
+                stopped.set()
+
+        async def chat(messages, tools=None):
+            if messages[-1]["content"] != "停止这一轮":
+                return await original_chat(messages, tools)
+            if waiting_for == "model":
+                await block()
+            call = {"id": "c1", "type": "function",
+                    "function": {"name": "get_market_overview", "arguments": "{}"}}
+            return ChatResult(message={"role": "assistant", "tool_calls": [call]}, finish_reason="tool_calls")
+
+        async def call_tool(_name, _arguments):
+            await block()
+
+        async def request(question, session_id, *, disconnect=False):
+            body = json.dumps({"message": question, "session_id": session_id}).encode()
+            responses = []
+
+            async def receive():
+                nonlocal body
+                if body is not None:
+                    payload, body = body, None
+                    return {"type": "http.request", "body": payload}
+                if disconnect:
+                    await started.wait()
+                    return {"type": "http.disconnect"}
+                await anyio.sleep_forever()
+
+            async def send(message):
+                responses.append(message.get("body", b""))
+
+            scope = {"type": "http", "asgi": {"spec_version": "2.4"}, "method": "POST",
+                     "path": "/chat", "headers": [], "query_string": b""}
+            await app(scope, receive, send)
+            return b"".join(responses)
+
+        llm.chat = chat
+        service._source.call_tool = call_tool
+        async with app.router.lifespan_context(app):
+            with anyio.fail_after(2):
+                await request("停止这一轮", "cancelled", disconnect=True)
+                await stopped.wait()
+                assert not await service._history("cancelled")
+                response = await request("继续", "next")
+                assert "下一轮成功".encode() in response
+
+    anyio.run(run)
+
+
 def test_agent_service_keeps_research_runtime_across_source_disposal(monkeypatch, tmp_path):
     from contextlib import asynccontextmanager
     from payback_agent.research_runtime import ResearchRuntime

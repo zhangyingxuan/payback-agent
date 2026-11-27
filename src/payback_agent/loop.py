@@ -7,6 +7,8 @@ arguments, unknown tools, iteration cap) is unit-testable with two fakes.
 
 from __future__ import annotations
 
+from contextlib import aclosing
+
 import json
 import re
 from dataclasses import dataclass, field
@@ -238,11 +240,13 @@ async def ask_events(
                                "messages": messages, "tools": tools})
         if stream is not None:
             result = None
-            async for kind, payload in stream(messages, tools):
-                if kind == "reasoning_delta":
-                    yield {"type": kind, "iteration": iteration, "text": payload}
-                elif kind == "result":
-                    result = payload
+            # SSE 取消时在原任务内关闭模型流，释放连接或子进程。
+            async with aclosing(stream(messages, tools)) as model_events:
+                async for kind, payload in model_events:
+                    if kind == "reasoning_delta":
+                        yield {"type": kind, "iteration": iteration, "text": payload}
+                    elif kind == "result":
+                        result = payload
         else:
             result = await llm.chat(messages, tools)
             if result.message.get("reasoning_content"):
